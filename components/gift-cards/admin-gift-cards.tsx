@@ -1,0 +1,159 @@
+"use client";
+
+import { useEffect, useState } from "react";
+import { useToast } from "@/components/toast";
+
+type GiftCard = {
+  id: string;
+  codePrefix: string;
+  codeSuffix: string;
+  amountUsd: number;
+  status: "active" | "redeemed";
+  createdBy: string;
+  redeemedBy: string | null;
+  redeemedAt: number | null;
+  createdAt: number;
+};
+
+type CreatedCard = GiftCard & { code: string };
+
+export function AdminGiftCards() {
+  const toast = useToast();
+  const [cards, setCards] = useState<GiftCard[]>([]);
+  const [created, setCreated] = useState<CreatedCard[]>([]);
+  const [amountUsd, setAmountUsd] = useState("10");
+  const [count, setCount] = useState("1");
+  const [busy, setBusy] = useState(false);
+  const [open, setOpen] = useState(false);
+  const [selected, setSelected] = useState<Set<string>>(new Set());
+
+  async function load() {
+    const res = await fetch("/api/gift-cards");
+    if (res.ok) setCards(await res.json());
+  }
+
+  useEffect(() => { load(); }, []);
+
+  const allSelected = cards.length > 0 && selected.size === cards.length;
+
+  async function createCards(e: React.FormEvent) {
+    e.preventDefault();
+    setBusy(true);
+    setCreated([]);
+    try {
+      const res = await fetch("/api/gift-cards", {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ amountUsd: Number(amountUsd), count: Number(count) }),
+      });
+      const data = await res.json().catch(() => ({}));
+      if (!res.ok) { toast(data.error || "生成失败"); return; }
+      setCreated(data.cards ?? []);
+      setOpen(true);
+      toast(`已生成 ${data.cards?.length ?? 0} 张礼品卡`);
+      load();
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  async function copyAllCreated() {
+    if (created.length === 0) return;
+    const text = created.map(card => card.code).join("\n");
+    await navigator.clipboard.writeText(text);
+    toast(`已复制 ${created.length} 张礼品卡`);
+  }
+
+  function toggleAll() {
+    setSelected(allSelected ? new Set() : new Set(cards.map(card => card.id)));
+  }
+
+  function toggleOne(id: string) {
+    setSelected(prev => {
+      const next = new Set(prev);
+      if (next.has(id)) next.delete(id);
+      else next.add(id);
+      return next;
+    });
+  }
+
+  async function deleteSelected() {
+    if (selected.size === 0 || !confirm(`确认删除 ${selected.size} 张礼品卡？`)) return;
+    const ids = [...selected];
+    const res = await fetch("/api/gift-cards", {
+      method: "DELETE",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ ids }),
+    });
+    const data = await res.json().catch(() => ({}));
+    if (!res.ok) { toast(data.error || "删除失败"); return; }
+    setSelected(new Set());
+    toast(`已删除 ${data.deleted ?? ids.length} 张礼品卡`);
+    load();
+  }
+
+  return (
+    <div className="gift-card-layout">
+      <div className="page-actions">
+        <button className="btn primary" onClick={() => { setCreated([]); setOpen(true); }}>+ 生成礼品卡 <span className="mono kbd">G</span></button>
+        {selected.size > 0 && <button className="btn danger" onClick={deleteSelected}>删除选中 <span className="mono kbd">{selected.size}</span></button>}
+      </div>
+
+      {open && (
+        <div className="modal-backdrop" onClick={() => !busy && setOpen(false)}>
+          <div className="modal gift-card-modal" onClick={e => e.stopPropagation()}>
+            <div className="modal-head">
+              <h2>生成礼品卡</h2>
+              <button className="modal-close" onClick={() => setOpen(false)} disabled={busy} aria-label="关闭">×</button>
+            </div>
+            <form onSubmit={createCards}>
+              <div className="modal-body gift-card-create">
+                <p className="dim">卡号只会在生成后显示一次，数据库仅保存哈希。请在生成后立即复制保存。</p>
+                <div className="gift-card-form-grid">
+                  <div className="field"><label>金额 USD</label><input className="mono" value={amountUsd} onChange={e => setAmountUsd(e.target.value)} inputMode="decimal" autoFocus /></div>
+                  <div className="field"><label>数量</label><input className="mono" value={count} onChange={e => setCount(e.target.value)} inputMode="numeric" /></div>
+                </div>
+                {created.length > 0 && (
+                  <div className="gift-card-created">
+                    <div className="gift-card-created-head">
+                      <h3>新生成卡号</h3>
+                      <button type="button" className="btn sm ghost" onClick={copyAllCreated}>复制全部</button>
+                    </div>
+                    <div className="gift-card-code-list mono">
+                      {created.map(card => <div key={card.id}>{card.code} <span>${card.amountUsd.toFixed(2)}</span></div>)}
+                    </div>
+                  </div>
+                )}
+              </div>
+              <div className="modal-foot">
+                <button type="button" className="btn ghost" onClick={() => setOpen(false)} disabled={busy}>关闭</button>
+                <button className="btn primary" disabled={busy}>{busy ? "生成中…" : "生成"}</button>
+              </div>
+            </form>
+          </div>
+        </div>
+      )}
+
+      <section className="section">
+        <h2>礼品卡记录</h2>
+        <table className="table">
+          <thead><tr><th><button type="button" className={`check-control ${allSelected ? "checked" : ""}`} onClick={toggleAll} aria-label="全选礼品卡" aria-pressed={allSelected} /></th><th>卡号</th><th>金额</th><th>状态</th><th>创建时间</th><th>核销用户</th><th>核销时间</th></tr></thead>
+          <tbody>
+            {cards.length === 0 && <tr><td colSpan={7} className="empty">暂无礼品卡</td></tr>}
+            {cards.map(card => (
+              <tr key={card.id}>
+                <td><button type="button" className={`check-control ${selected.has(card.id) ? "checked" : ""}`} onClick={() => toggleOne(card.id)} aria-label={`选择礼品卡 ${card.codePrefix}${card.codeSuffix}`} aria-pressed={selected.has(card.id)} /></td>
+                <td className="mono">{card.codePrefix}****{card.codeSuffix}</td>
+                <td className="mono">${card.amountUsd.toFixed(2)}</td>
+                <td>{card.status === "active" ? <span className="status ok"><span className="dot ok" />可核销</span> : <span className="status"><span className="dot" />已核销</span>}</td>
+                <td className="mono dim">{new Date(card.createdAt).toLocaleString()}</td>
+                <td className="mono dim">{card.redeemedBy || "—"}</td>
+                <td className="mono dim">{card.redeemedAt ? new Date(card.redeemedAt).toLocaleString() : "—"}</td>
+              </tr>
+            ))}
+          </tbody>
+        </table>
+      </section>
+    </div>
+  );
+}

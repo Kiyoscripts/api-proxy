@@ -1,0 +1,49 @@
+import { NextRequest } from "next/server";
+import { proxyOnce } from "@/lib/proxy";
+
+export const dynamic = "force-dynamic";
+export const runtime = "nodejs";
+
+function authFromHeaders(headers: Headers) {
+  return headers.get("authorization")
+    ?? headers.get("x-api-key")
+    ?? headers.get("api-key");
+}
+
+/**
+ * OpenAI 兼容入站
+ * POST /v1/chat/completions
+ * Authorization: Bearer sk-relay-XXXX
+ */
+export async function POST(req: NextRequest) {
+  const body = await req.text();
+  const stream = (() => {
+    const a = req.headers.get("accept") ?? "";
+    if (a.includes("text/event-stream")) return true;
+    try { return !!JSON.parse(body).stream; } catch { return false; }
+  })();
+
+  const result = await proxyOnce({
+    type: "openai",
+    body,
+    stream,
+    rawAuth: authFromHeaders(req.headers),
+    signal: req.signal,
+    incomingHeaders: req.headers,
+  });
+
+  if (result.kind === "success") return result.response;
+  if (result.kind === "client_error") {
+    return new Response(JSON.stringify({ request_id: result.requestId, error: { message: result.error, type: "invalid_request_error", request_id: result.requestId } }), {
+      status: result.status,
+      headers: { "content-type": "application/json", "x-request-id": result.requestId },
+    });
+  }
+  return new Response(JSON.stringify({
+    request_id: result.requestId,
+    error: { message: result.error, type: "api_error", request_id: result.requestId },
+  }), {
+    status: result.status,
+    headers: { "content-type": "application/json", "x-request-id": result.requestId },
+  });
+}

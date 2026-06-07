@@ -1,0 +1,126 @@
+# 落地实施计划
+
+> 将单文件 HTML 演示（`index.html`）迁移到 **Next.js 15 + Bun + PostgreSQL + Redis** 的全栈项目。
+
+## 进度索引
+
+| # | 任务 | 状态 | 备注 |
+|---|---|---|---|
+| 1 | 清理 Python 占位、初始化 Next.js + Bun 骨架 | 进行中 | |
+| 2 | 数据层：PostgreSQL Drizzle schema | 完成 | SQLite 依赖已剔除 |
+| 3 | 全局样式迁移（终端暗色 token） | 待办 | |
+| 4 | 根布局：Topbar + 路由导航 | 待办 | |
+| 5 | API 层：keys / channels / stats / activity | 待办 | |
+| 6 | 日志流：SSE 接口 + 后台模拟生成器 | 待办 | |
+| 7 | Dashboard 页面（服务端渲染） | 待办 | |
+| 8 | Keys 页面（客户端交互） | 待办 | |
+| 9 | Channels 页面（客户端交互） | 待办 | |
+| 10 | Logs 页面（SSE 客户端） | 待办 | |
+| 11 | 启动 dev 验证 | 待办 | |
+
+## 详细设计
+
+详见 [`docs/plan/landing.md`](./plan/landing.md)
+
+## 渠道最大并发与排队
+
+| # | 任务 | 状态 | 备注 |
+|---|---|---|---|
+| 1 | 数据层新增 `max_concurrency` | 完成 | 详见 [`docs/plan/channel-concurrency.md`](./plan/channel-concurrency.md) |
+| 2 | 渠道 API 与表单支持配置最大并发 | 完成 | |
+| 3 | 代理转发按渠道并发队列排队 | 完成 | |
+| 4 | 类型检查与页面验证 | 完成 | |
+
+## 渠道定时监控
+
+| # | 任务 | 状态 | 备注 |
+|---|---|---|---|
+| 1 | 数据层新增 `monitor_interval_sec` | 完成 | 详见 [`docs/plan/channel-monitoring.md`](./plan/channel-monitoring.md) |
+| 2 | 抽取统一渠道测试逻辑 | 完成 | |
+| 3 | 进程内定时调度器按渠道间隔测试 | 完成 | |
+| 4 | 渠道表单与 API 支持配置间隔 | 完成 | |
+| 5 | 类型检查与页面验证 | 完成 | |
+
+## 模型映射
+
+| # | 任务 | 状态 | 备注 |
+|---|---|---|---|
+| 1 | 数据层新增模型映射表 | 完成 | 详见 [`docs/plan/model-mapping.md`](./plan/model-mapping.md) |
+| 2 | 模型映射 CRUD API | 完成 | |
+| 3 | 代理转发应用模型映射 | 完成 | |
+| 4 | 新增模型映射页面与导航 | 完成 | |
+| 5 | 类型检查与页面验证 | 完成 | |
+
+## 功能增强路线图
+
+| # | 任务 | 状态 | 备注 |
+|---|---|---|---|
+| 1 | 模型映射可观测性：表格显示绑定渠道名称，日志记录入站/上游模型差异 | 完成 | 详见 [`docs/plan/enhancement-roadmap.md`](./plan/enhancement-roadmap.md) |
+| 2 | 模型映射管理增强：支持编辑映射、批量失败详情、绑定渠道展示与校验 | 完成 | |
+| 3 | `/v1/models` 调试日志设置化 | 完成 | 默认关闭，在设置页开启 |
+| 4 | 渠道路由优化：并发满时优先尝试其他未满渠道 | 完成 | 避免已选渠道单点排队 |
+| 5 | 渠道测试历史页面或弹窗 | 完成 | 展示测试时间、延迟、错误摘要 |
+| 6 | 可配置请求重试策略 | 完成 | 在设置页配置最大重试次数与 429/5xx/网络错误策略 |
+| 7 | API Key 配额硬拦截 | 完成 | 超额返回 429 并记录日志 |
+| 8 | API Key 级限速与并发限制 | 完成 | RPM/TPM/并发，管理端可配置 |
+| 9 | 成本统计与模型定价配置 | 完成 | 独立定价页按服务商 + 模型配置输入/输出单价 |
+| 10 | 渠道自动熔断与自动恢复 | 完成 | 健康测试失败置为 err 后不参与转发，后续测试成功自动恢复 |
+| 11 | 配置导入/导出 | 完成 | 设置页支持导出与导入渠道、映射、设置，密钥脱敏 |
+| 12 | 管理操作审计补全 | 完成 | 覆盖密钥、渠道、测试、映射、设置、导入等关键写操作 |
+| 13 | 请求日志、渠道测试、审计日志导出 | 完成 | 设置页提供 CSV 导出，API 支持 JSON/CSV |
+| 14 | 多实例支持 | 完成 | 渠道监控使用 DB 调度锁避免多实例重复测试；请求队列仍为单实例进程内 |
+| 15 | 后台任务进程拆分 | 完成 | 新增 worker 触发 API，可由外部 cron/worker 启动监控 |
+| 16 | 管理端账号密码用户功能 | 待规划 | 临时管理密码已移除，未来单独实现用户体系 |
+| 17 | 请求体隐私保护策略 | 完成 | 设置页配置 body preview 开关和最大长度 |
+| 18 | OpenAI/Claude 协议转换 | 待办 | 工具调用与流式事件转换，复杂度高 |
+| 19 | 用户管理模块 | 完成 | 用户 CRUD，角色限定为超级管理员/管理员/用户；尚未接入登录鉴权 |
+
+## 技术决策
+
+- **运行时/包管理**：Bun（package manager + scripts），Next.js CLI 在 Node.js 之上运行
+- **框架**：Next.js 15 App Router + TypeScript + React 19
+- **数据库**：PostgreSQL + Drizzle ORM，Redis 承载跨实例限流/并发/日志 fanout
+- **样式**：单一 `globals.css`，复用原 OKLCH token，无 Tailwind
+- **实时**：SSE（`/api/logs/stream`），与日志生成器单例共享内存队列
+- **数据**：PostgreSQL/Redis 通过环境变量连接，本地和线上均不使用 SQLite
+
+## 用户端 / 管理端隔离
+
+| # | 任务 | 状态 | 备注 |
+|---|---|---|---|
+| 1 | 身份上下文与作用域 helper | 完成 | 详见 [`docs/plan/user-admin-split.md`](./plan/user-admin-split.md) |
+| 2 | API Key 接口与界面按角色拆分 | 完成 | 用户端仅自己的 Key，管理端全部 + 用户筛选 |
+| 3 | 日志接口、SSE 与导出按用户隔离 | 完成 | 基于 `request_logs.key_id -> keys.user_id` |
+| 4 | 统计与 Dashboard 拆分 | 完成 | 用户端个人统计，管理端全局统计 |
+| 5 | 管理专属页面迁移到 `/admin/*` | 完成 | 已新增管理总览、管理 Key、管理日志，并隐藏普通导航管理项 |
+| 6 | 管理专属 API 加权限守卫 | 部分完成 | 已覆盖用户、Key、日志、统计、导出、渠道、映射、定价、设置、审计；其余细分子路由后续补齐 |
+| 7 | 导航按角色切分 | 完成 | 用户端与管理端入口分离 |
+| 8 | 聚焦验证 | 完成 | `npx tsc --noEmit` 通过；未执行完整 build |
+
+## PostgreSQL + Redis 高并发迁移
+
+| # | 任务 | 状态 | 备注 |
+|---|---|---|---|
+| 1 | 迁移设计与风险拆分 | 完成 | 详见 [`docs/plan/redis-postgres-migration.md`](./plan/redis-postgres-migration.md) |
+| 2 | 数据层切到 PostgreSQL | 完成 | SQLite schema、连接、迁移脚本和 `better-sqlite3` 依赖已移除 |
+| 3 | 并发队列与限流从内存切到 Redis | 完成 | 用户/Key/渠道最大并发、用户/Key RPM/TPM、渠道健康检查锁、日志 SSE fanout 已接入 Redis |
+| 4 | 日志写入与统计查询适配 PostgreSQL | 进行中 | 日志列表、日志导出、活动、渠道状态、Dashboard/排行榜、用户详情统计已支持 PG mode；索引/分页/聚合性能仍待压测 |
+| 5 | Docker Compose 增加 app + postgres + redis | 完成 | Compose 已加入 PostgreSQL 与 Redis 服务 |
+| 6 | 多副本部署验证 | 待办 | 限流一致性、流式请求、日志实时性 |
+| 7 | 运行时 async 化：settings | 完成 | `getSettingsAsync` / `updateSettingsAsync` 已支持 PG mode，主要调用方已迁移 |
+| 8 | 运行时 async 化：auth/users | 完成 | 登录、注册、邮箱验证、找回密码、当前用户、用户列表/创建/更新/删除、用户额度已支持 PG mode |
+| 9 | 运行时 async 化：keys | 完成 | Key 列表/创建/更新/删除、Key 页面计数、代理鉴权和用量查询已支持 PG mode |
+| 10 | 运行时 async 化：proxy/log-generator | 完成 | 代理 Key 鉴权、用户限额/限流 fallback、用户最大并发、渠道选择、模型映射/目录、请求详情设置读取、请求日志写入、Key/用户用量更新、日志查询/导出和统计读取已支持 PG mode |
+| 11 | 运行时 async 化：channels | 完成 | 渠道列表/创建/更新/删除、测试、测试历史、批量测试、模型拉取、健康写入已支持 PG mode |
+| 12 | 运行时 async 化：models/mappings/pricing | 完成 | 模型目录、模型映射、模型定价 CRUD 与 `/v1/models` 列表已支持 PG mode |
+| 13 | 运行时 async 化：config/health/worker | 完成 | 配置导入导出、健康检查、渠道监控定时器已支持 PG mode |
+
+## 礼品卡
+
+| # | 任务 | 状态 | 备注 |
+|---|---|---|---|
+| 1 | 数据层新增礼品卡表 | 完成 | 详见 [`docs/plan/gift-cards.md`](./plan/gift-cards.md) |
+| 2 | 管理端生成/列表 API | 完成 | |
+| 3 | 用户端核销 API | 完成 | 核销后增加 `user_quotas.quotaUsd` |
+| 4 | 管理端与用户端页面 | 完成 | |
+| 5 | 类型检查与本地验证 | 完成 | `npx tsc --noEmit` 通过；本地 PG schema 已 push |

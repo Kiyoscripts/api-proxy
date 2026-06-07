@@ -1,0 +1,15 @@
+node_modules
+.next
+data
+.git
+.codegraph
+.claude
+.playwright-mcp
+*.tsbuildinfo
+.env
+.env.*
+!.env.example
+.env*.local
+npm-debug.log*
+yarn-error.log*
+.DS_Store

@@ -1,0 +1,374 @@
+import { db, schema } from "./db";
+import { eq } from "drizzle-orm";
+import type { LogEntry } from "./types";
+import { addTpm } from "@/lib/rate-limit";
+import { getRedis } from "@/lib/redis";
+import { usePostgres } from "@/lib/db/runtime";
+
+type Subscriber = (entry: LogEntry) => void;
+type LogInput = Omit<LogEntry, "id" | "cacheTokens" | "cacheReadTokens" | "cacheCreationTokens" | "ttftMs" | "durationMs" | "cost"> & {
+  cacheTokens?: number;
+  cacheReadTokens?: number;
+  cacheCreationTokens?: number;
+  ttftMs?: number;
+  durationMs?: number;
+  cost?: number;
+};
+
+class LogHub {
+  version = 4;
+  private subscribers = new Set<Subscriber>();
+  private redisStarted = false;
+  private instanceId = crypto.randomUUID();
+
+  subscribe(fn: Subscriber) {
+    this.startRedisFanout();
+    this.subscribers.add(fn);
+    return () => { this.subscribers.delete(fn); };
+  }
+
+  /**
+   * 记录一条请求日志：写库 + 推送给所有 SSE 订阅者。
+   * 仅由真实代理路径调用。
+   */
+  record(e: LogInput): LogEntry {
+    const ts = e.ts || Date.now();
+    const info = db.insert(schema.requestLogs).values({
+      ts,
+      requestId: e.requestId,
+      keyId: e.keyId, channelId: e.channelId, model: e.model,
+      inboundModel: e.inboundModel || e.model,
+      upstreamModel: e.upstreamModel || e.model,
+      mappingId: e.mappingId || "",
+      mappedChannelIds: e.mappedChannelIds ?? [],
+      status: e.status, latencyMs: e.latencyMs,
+      ttftMs: e.ttftMs ?? e.latencyMs,
+      durationMs: e.durationMs ?? e.latencyMs,
+      tokensIn: e.tokensIn, tokensOut: e.tokensOut,
+      cacheTokens: e.cacheTokens ?? 0,
+      cacheReadTokens: e.cacheReadTokens ?? 0,
+      cacheCreationTokens: e.cacheCreationTokens ?? 0,
+      requestDetail: e.requestDetail ?? null,
+      errorMsg: e.errorMsg,
+    }).run();
+
+    if (e.keyId) {
+      const cost = e.cost ?? logCost(e.channelType, e.model, e.tokensIn, e.tokensOut, e.cacheReadTokens ?? 0, e.cacheCreationTokens ?? 0);
+      const addTok = (e.tokensIn + e.tokensOut) / 1_000_000;
+      const key = db.select().from(schema.keys).where(eq(schema.keys.id, e.keyId)).get();
+      db.update(schema.keys)
+        .set({
+          lastUsedAt: ts,
+          used: (key?.used ?? 0) + addTok,
+        })
+        .where(eq(schema.keys.id, e.keyId))
+        .run();
+      addUserUsage(key?.userId, e.tokensIn + e.tokensOut, cost);
+      void addTokenUsage(e.keyId, key?.userId, e.tokensIn + e.tokensOut);
+    }
+
+    const entry: LogEntry = {
+      id: Number(info.lastInsertRowid),
+      requestId: e.requestId,
+      ts,
+      keyId: e.keyId, keyName: e.keyName, keyPrefix: e.keyPrefix,
+      channelId: e.channelId, channelName: e.channelName, channelType: e.channelType,
+      model: e.model, status: e.status, latencyMs: e.latencyMs,
+      inboundModel: e.inboundModel || e.model,
+      upstreamModel: e.upstreamModel || e.model,
+      mappingId: e.mappingId || "",
+      mappedChannelIds: e.mappedChannelIds ?? [],
+      ttftMs: e.ttftMs ?? e.latencyMs,
+      durationMs: e.durationMs ?? e.latencyMs,
+      tokensIn: e.tokensIn, tokensOut: e.tokensOut,
+      cacheTokens: e.cacheTokens ?? 0,
+      cacheReadTokens: e.cacheReadTokens ?? 0,
+      cacheCreationTokens: e.cacheCreationTokens ?? 0,
+      requestDetail: e.requestDetail ?? null,
+      errorMsg: e.errorMsg,
+      cost: e.cost ?? 0,
+    };
+    for (const sub of this.subscribers) {
+      try { sub(entry); } catch { /* */ }
+    }
+    this.publish(entry);
+    return entry;
+  }
+
+  async recordAsync(e: LogInput): Promise<LogEntry> {
+    if (!usePostgres()) return this.record(e);
+    const { pgDb, pgSchema } = await import("@/lib/db/pg");
+    const ts = e.ts || Date.now();
+    const inserted = await pgDb.insert(pgSchema.requestLogs).values({
+      ts,
+      requestId: e.requestId,
+      keyId: e.keyId, channelId: e.channelId, model: e.model,
+      inboundModel: e.inboundModel || e.model,
+      upstreamModel: e.upstreamModel || e.model,
+      mappingId: e.mappingId || "",
+      mappedChannelIds: e.mappedChannelIds ?? [],
+      status: e.status, latencyMs: e.latencyMs,
+      ttftMs: e.ttftMs ?? e.latencyMs,
+      durationMs: e.durationMs ?? e.latencyMs,
+      tokensIn: e.tokensIn, tokensOut: e.tokensOut,
+      cacheTokens: e.cacheTokens ?? 0,
+      cacheReadTokens: e.cacheReadTokens ?? 0,
+      cacheCreationTokens: e.cacheCreationTokens ?? 0,
+      requestDetail: e.requestDetail ?? null,
+      errorMsg: e.errorMsg,
+    }).returning({ id: pgSchema.requestLogs.id });
+
+    if (e.keyId) {
+      const cost = e.cost ?? await logCostAsync(e.channelType, e.model, e.tokensIn, e.tokensOut, e.cacheReadTokens ?? 0, e.cacheCreationTokens ?? 0);
+      const addTok = (e.tokensIn + e.tokensOut) / 1_000_000;
+      const key = (await pgDb.select().from(pgSchema.keys).where(eq(pgSchema.keys.id, e.keyId)).limit(1))[0];
+      await pgDb.update(pgSchema.keys).set({ lastUsedAt: ts, used: (key?.used ?? 0) + addTok }).where(eq(pgSchema.keys.id, e.keyId));
+      await addUserUsageAsync(key?.userId, e.tokensIn + e.tokensOut, cost);
+      void addTokenUsage(e.keyId, key?.userId, e.tokensIn + e.tokensOut);
+    }
+
+    const entry = logEntryFromInput(Number(inserted[0]?.id ?? 0), ts, e);
+    this.emit(entry);
+    this.publish(entry);
+    return entry;
+  }
+
+  update(id: number, e: LogInput): LogEntry {
+    const prev = db.select().from(schema.requestLogs).where(eq(schema.requestLogs.id, id)).get();
+    db.update(schema.requestLogs).set({
+      ts: e.ts,
+      requestId: e.requestId,
+      keyId: e.keyId,
+      channelId: e.channelId,
+      model: e.model,
+      inboundModel: e.inboundModel || e.model,
+      upstreamModel: e.upstreamModel || e.model,
+      mappingId: e.mappingId || "",
+      mappedChannelIds: e.mappedChannelIds ?? [],
+      status: e.status,
+      latencyMs: e.latencyMs,
+      ttftMs: e.ttftMs ?? e.latencyMs,
+      durationMs: e.durationMs ?? e.latencyMs,
+      tokensIn: e.tokensIn,
+      tokensOut: e.tokensOut,
+      cacheTokens: e.cacheTokens ?? 0,
+      cacheReadTokens: e.cacheReadTokens ?? 0,
+      cacheCreationTokens: e.cacheCreationTokens ?? 0,
+      requestDetail: e.requestDetail ?? null,
+      errorMsg: e.errorMsg,
+    }).where(eq(schema.requestLogs.id, id)).run();
+
+    if (e.keyId) {
+      const oldTokens = prev ? prev.tokensIn + prev.tokensOut : 0;
+      const newTokens = e.tokensIn + e.tokensOut;
+      const oldCost = prev ? logCost(e.channelType, prev.model, prev.tokensIn, prev.tokensOut, prev.cacheReadTokens, prev.cacheCreationTokens) : 0;
+      const newCost = e.cost ?? logCost(e.channelType, e.model, e.tokensIn, e.tokensOut, e.cacheReadTokens ?? 0, e.cacheCreationTokens ?? 0);
+      const addTok = (newTokens - oldTokens) / 1_000_000;
+      if (addTok !== 0) {
+        const key = db.select().from(schema.keys).where(eq(schema.keys.id, e.keyId)).get();
+        db.update(schema.keys)
+          .set({ lastUsedAt: e.ts, used: (key?.used ?? 0) + addTok })
+          .where(eq(schema.keys.id, e.keyId))
+          .run();
+          addUserUsage(key?.userId, newTokens - oldTokens, newCost - oldCost);
+          void addTokenUsage(e.keyId, key?.userId, newTokens - oldTokens);
+      }
+    }
+
+    const entry: LogEntry = {
+      id,
+      requestId: e.requestId,
+      ts: e.ts,
+      keyId: e.keyId, keyName: e.keyName, keyPrefix: e.keyPrefix,
+      channelId: e.channelId, channelName: e.channelName, channelType: e.channelType,
+      model: e.model, status: e.status, latencyMs: e.latencyMs,
+      inboundModel: e.inboundModel || e.model,
+      upstreamModel: e.upstreamModel || e.model,
+      mappingId: e.mappingId || "",
+      mappedChannelIds: e.mappedChannelIds ?? [],
+      ttftMs: e.ttftMs ?? e.latencyMs,
+      durationMs: e.durationMs ?? e.latencyMs,
+      tokensIn: e.tokensIn, tokensOut: e.tokensOut,
+      cacheTokens: e.cacheTokens ?? 0,
+      cacheReadTokens: e.cacheReadTokens ?? 0,
+      cacheCreationTokens: e.cacheCreationTokens ?? 0,
+      requestDetail: e.requestDetail ?? null,
+      errorMsg: e.errorMsg,
+      cost: e.cost ?? 0,
+    };
+    for (const sub of this.subscribers) {
+      try { sub(entry); } catch { /* */ }
+    }
+    this.publish(entry);
+    return entry;
+  }
+
+  async updateAsync(id: number, e: LogInput): Promise<LogEntry> {
+    if (!usePostgres()) return this.update(id, e);
+    const { pgDb, pgSchema } = await import("@/lib/db/pg");
+    const prev = (await pgDb.select().from(pgSchema.requestLogs).where(eq(pgSchema.requestLogs.id, id)).limit(1))[0];
+    await pgDb.update(pgSchema.requestLogs).set({
+      ts: e.ts,
+      requestId: e.requestId,
+      keyId: e.keyId,
+      channelId: e.channelId,
+      model: e.model,
+      inboundModel: e.inboundModel || e.model,
+      upstreamModel: e.upstreamModel || e.model,
+      mappingId: e.mappingId || "",
+      mappedChannelIds: e.mappedChannelIds ?? [],
+      status: e.status,
+      latencyMs: e.latencyMs,
+      ttftMs: e.ttftMs ?? e.latencyMs,
+      durationMs: e.durationMs ?? e.latencyMs,
+      tokensIn: e.tokensIn,
+      tokensOut: e.tokensOut,
+      cacheTokens: e.cacheTokens ?? 0,
+      cacheReadTokens: e.cacheReadTokens ?? 0,
+      cacheCreationTokens: e.cacheCreationTokens ?? 0,
+      requestDetail: e.requestDetail ?? null,
+      errorMsg: e.errorMsg,
+    }).where(eq(pgSchema.requestLogs.id, id));
+
+    if (e.keyId) {
+      const oldTokens = prev ? prev.tokensIn + prev.tokensOut : 0;
+      const newTokens = e.tokensIn + e.tokensOut;
+      const oldCost = prev ? await logCostAsync(e.channelType, prev.model, prev.tokensIn, prev.tokensOut, prev.cacheReadTokens, prev.cacheCreationTokens) : 0;
+      const newCost = e.cost ?? await logCostAsync(e.channelType, e.model, e.tokensIn, e.tokensOut, e.cacheReadTokens ?? 0, e.cacheCreationTokens ?? 0);
+      const addTok = (newTokens - oldTokens) / 1_000_000;
+      if (addTok !== 0) {
+        const key = (await pgDb.select().from(pgSchema.keys).where(eq(pgSchema.keys.id, e.keyId)).limit(1))[0];
+        await pgDb.update(pgSchema.keys).set({ lastUsedAt: e.ts, used: (key?.used ?? 0) + addTok }).where(eq(pgSchema.keys.id, e.keyId));
+        await addUserUsageAsync(key?.userId, newTokens - oldTokens, newCost - oldCost);
+        void addTokenUsage(e.keyId, key?.userId, newTokens - oldTokens);
+      }
+    }
+
+    const entry = logEntryFromInput(id, e.ts, e);
+    this.emit(entry);
+    this.publish(entry);
+    return entry;
+  }
+
+  private emit(entry: LogEntry) {
+    for (const sub of this.subscribers) {
+      try { sub(entry); } catch { /* */ }
+    }
+  }
+
+  private publish(entry: LogEntry) {
+    void getRedis().then(redis => redis?.publish("logs:stream", JSON.stringify({ instanceId: this.instanceId, entry }))).catch(() => null);
+  }
+
+  private startRedisFanout() {
+    if (this.redisStarted) return;
+    this.redisStarted = true;
+    void getRedis().then(async redis => {
+      if (!redis) return;
+      const subscriber = redis.duplicate();
+      await subscriber.connect();
+      await subscriber.subscribe("logs:stream", message => {
+        try {
+          const data = JSON.parse(message) as { instanceId?: string; entry?: LogEntry };
+          if (data.instanceId === this.instanceId || !data.entry) return;
+          for (const sub of this.subscribers) {
+            try { sub(data.entry); } catch { /* */ }
+          }
+        } catch { /* ignore malformed pubsub messages */ }
+      });
+    }).catch(() => { this.redisStarted = false; });
+  }
+}
+
+function addUserUsage(userId: string | undefined, tokens: number, usd: number) {
+  if (!userId || (tokens === 0 && usd === 0)) return;
+  const quota = db.select().from(schema.userQuotas).where(eq(schema.userQuotas.userId, userId)).get();
+  if (!quota) return;
+  db.update(schema.userQuotas)
+    .set({
+      dailyUsedTokens: Math.max(0, quota.dailyUsedTokens + tokens),
+      monthlyUsedTokens: Math.max(0, quota.monthlyUsedTokens + tokens),
+      dailyUsedUsd: Math.max(0, quota.dailyUsedUsd + usd),
+      monthlyUsedUsd: Math.max(0, quota.monthlyUsedUsd + usd),
+      usedUsd: Math.max(0, quota.usedUsd + usd),
+      updatedAt: Date.now(),
+    })
+    .where(eq(schema.userQuotas.userId, userId))
+    .run();
+}
+
+async function addUserUsageAsync(userId: string | undefined, tokens: number, usd: number) {
+  if (!userId || (tokens === 0 && usd === 0)) return;
+  const { pgDb, pgSchema } = await import("@/lib/db/pg");
+  const quota = (await pgDb.select().from(pgSchema.userQuotas).where(eq(pgSchema.userQuotas.userId, userId)).limit(1))[0];
+  if (!quota) return;
+  await pgDb.update(pgSchema.userQuotas)
+    .set({
+      dailyUsedTokens: Math.max(0, quota.dailyUsedTokens + tokens),
+      monthlyUsedTokens: Math.max(0, quota.monthlyUsedTokens + tokens),
+      dailyUsedUsd: Math.max(0, quota.dailyUsedUsd + usd),
+      monthlyUsedUsd: Math.max(0, quota.monthlyUsedUsd + usd),
+      usedUsd: Math.max(0, quota.usedUsd + usd),
+      updatedAt: Date.now(),
+    })
+    .where(eq(pgSchema.userQuotas.userId, userId));
+}
+
+async function addTokenUsage(keyId: string, userId: string | undefined, tokens: number) {
+  if (tokens <= 0) return;
+  await addTpm("key", keyId, tokens);
+  if (userId) await addTpm("user", userId, tokens);
+}
+
+function logCost(provider: "claude" | "openai", model: string, tokensIn: number, tokensOut: number, cacheReadTokens: number, cacheCreationTokens: number) {
+  const price = db.select().from(schema.modelPrices).where(eq(schema.modelPrices.model, model)).all().find(p => p.provider === provider);
+  if (!price) return 0;
+  return (tokensIn / 1_000_000) * price.inputPricePerMTok
+    + (tokensOut / 1_000_000) * price.outputPricePerMTok
+    + (cacheReadTokens / 1_000_000) * price.cacheReadPricePerMTok
+    + (cacheCreationTokens / 1_000_000) * price.cacheCreationPricePerMTok;
+}
+
+async function logCostAsync(provider: "claude" | "openai", model: string, tokensIn: number, tokensOut: number, cacheReadTokens: number, cacheCreationTokens: number) {
+  const { pgDb, pgSchema } = await import("@/lib/db/pg");
+  const prices = await pgDb.select().from(pgSchema.modelPrices).where(eq(pgSchema.modelPrices.model, model));
+  const price = prices.find(p => p.provider === provider);
+  if (!price) return 0;
+  return (tokensIn / 1_000_000) * price.inputPricePerMTok
+    + (tokensOut / 1_000_000) * price.outputPricePerMTok
+    + (cacheReadTokens / 1_000_000) * price.cacheReadPricePerMTok
+    + (cacheCreationTokens / 1_000_000) * price.cacheCreationPricePerMTok;
+}
+
+function logEntryFromInput(id: number, ts: number, e: LogInput): LogEntry {
+  return {
+    id,
+    requestId: e.requestId,
+    ts,
+    keyId: e.keyId, keyName: e.keyName, keyPrefix: e.keyPrefix,
+    channelId: e.channelId, channelName: e.channelName, channelType: e.channelType,
+    model: e.model, status: e.status, latencyMs: e.latencyMs,
+    inboundModel: e.inboundModel || e.model,
+    upstreamModel: e.upstreamModel || e.model,
+    mappingId: e.mappingId || "",
+    mappedChannelIds: e.mappedChannelIds ?? [],
+    ttftMs: e.ttftMs ?? e.latencyMs,
+    durationMs: e.durationMs ?? e.latencyMs,
+    tokensIn: e.tokensIn, tokensOut: e.tokensOut,
+    cacheTokens: e.cacheTokens ?? 0,
+    cacheReadTokens: e.cacheReadTokens ?? 0,
+    cacheCreationTokens: e.cacheCreationTokens ?? 0,
+    requestDetail: e.requestDetail ?? null,
+    errorMsg: e.errorMsg,
+    cost: e.cost ?? 0,
+  };
+}
+
+declare global {
+  // eslint-disable-next-line no-var
+  var __logHub: LogHub | undefined;
+}
+
+const existing = globalThis.__logHub as (LogHub & { update?: unknown; version?: number }) | undefined;
+export const logHub = existing && existing.version === 4 && typeof existing.update === "function" ? existing : new LogHub();
+globalThis.__logHub = logHub;

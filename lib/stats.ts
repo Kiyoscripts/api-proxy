@@ -1,0 +1,698 @@
+import { db, schema } from "./db";
+import { and, desc, eq, gte, lt, or } from "drizzle-orm";
+import type { DashboardRange, DashboardStats, LogEntry } from "./types";
+import { usePostgres } from "./db/runtime";
+
+const HOUR = 60 * 60 * 1000;
+const DAY = 24 * HOUR;
+const STALE_ACTIVE_MS = 30 * 60 * 1000;
+
+function rangeStart(range: DashboardRange, now = Date.now()) {
+  if (range === "today") {
+    const d = new Date(now);
+    d.setHours(0, 0, 0, 0);
+    return d.getTime();
+  }
+  if (range === "7d") return now - 7 * DAY;
+  return now - DAY;
+}
+
+type DashboardPeriod = DashboardRange | { since: number; until: number };
+
+function resolvePeriod(input: DashboardPeriod, now = Date.now()) {
+  if (typeof input === "object") {
+    const since = Math.max(0, input.since);
+    const until = Math.max(since + 1, input.until);
+    return { since, until };
+  }
+  return { since: rangeStart(input, now), until: now };
+}
+
+function percentile(sorted: number[], p: number) {
+  if (sorted.length === 0) return 0;
+  const idx = Math.min(sorted.length - 1, Math.ceil((p / 100) * sorted.length) - 1);
+  return sorted[idx];
+}
+
+export function getDashboardStats(period: DashboardPeriod = "24h", opts: { userId?: string } = {}): DashboardStats {
+  const now = Date.now();
+  cleanupStaleActiveRequests(now);
+  const prices = db.select().from(schema.modelPrices).all();
+  const priceMap = new Map(prices.map(p => [`${p.provider}:${p.model}`, p]));
+  const costFor = (provider: "claude" | "openai", model: string, inputTokens: number, outputTokens: number, cacheReadTokens = 0, cacheCreationTokens = 0) => {
+    const price = priceMap.get(`${provider}:${model}`);
+    if (!price) return 0;
+    return (inputTokens / 1_000_000) * price.inputPricePerMTok
+      + (outputTokens / 1_000_000) * price.outputPricePerMTok
+      + (cacheReadTokens / 1_000_000) * price.cacheReadPricePerMTok
+      + (cacheCreationTokens / 1_000_000) * price.cacheCreationPricePerMTok;
+  };
+  const { since, until } = resolvePeriod(period, now);
+  const periodMs = Math.max(1, until - since);
+  const prevSince = since - periodMs;
+  const ownerWhere = opts.userId ? eq(schema.keys.userId, opts.userId) : undefined;
+
+  const rangeRows = db
+    .select({
+      id: schema.requestLogs.id,
+      requestId: schema.requestLogs.requestId,
+      ts: schema.requestLogs.ts,
+      status: schema.requestLogs.status,
+      latencyMs: schema.requestLogs.latencyMs,
+      ttftMs: schema.requestLogs.ttftMs,
+      durationMs: schema.requestLogs.durationMs,
+      model: schema.requestLogs.model,
+      tokensIn: schema.requestLogs.tokensIn,
+      tokensOut: schema.requestLogs.tokensOut,
+      cacheTokens: schema.requestLogs.cacheTokens,
+      cacheReadTokens: schema.requestLogs.cacheReadTokens,
+      cacheCreationTokens: schema.requestLogs.cacheCreationTokens,
+      channelId: schema.channels.id,
+      channelName: schema.channels.name,
+      channelType: schema.channels.type,
+      keyId: schema.keys.id,
+      keyName: schema.keys.name,
+      keyPrefix: schema.keys.prefix,
+      keyUserId: schema.keys.userId,
+      userDisplayName: schema.users.displayName,
+      username: schema.users.username,
+      keyLastUsedAt: schema.keys.lastUsedAt,
+    })
+    .from(schema.requestLogs)
+    .leftJoin(schema.channels, eq(schema.channels.id, schema.requestLogs.channelId))
+    .leftJoin(schema.keys, eq(schema.keys.id, schema.requestLogs.keyId))
+    .leftJoin(schema.users, eq(schema.users.id, schema.keys.userId))
+    .where(ownerWhere ? and(gte(schema.requestLogs.ts, since), lt(schema.requestLogs.ts, until), ownerWhere) : and(gte(schema.requestLogs.ts, since), lt(schema.requestLogs.ts, until)))
+    .all();
+
+  const prevRows = db
+    .select({ id: schema.requestLogs.id })
+    .from(schema.requestLogs)
+    .leftJoin(schema.keys, eq(schema.keys.id, schema.requestLogs.keyId))
+    .where(ownerWhere ? and(gte(schema.requestLogs.ts, prevSince), lt(schema.requestLogs.ts, since), ownerWhere) : and(gte(schema.requestLogs.ts, prevSince), lt(schema.requestLogs.ts, since)))
+    .all();
+  const activeConversations = db
+    .select({ id: schema.requestLogs.id })
+    .from(schema.requestLogs)
+    .leftJoin(schema.keys, eq(schema.keys.id, schema.requestLogs.keyId))
+    .where(ownerWhere ? and(eq(schema.requestLogs.durationMs, 0), gte(schema.requestLogs.ts, now - STALE_ACTIVE_MS), ownerWhere) : and(eq(schema.requestLogs.durationMs, 0), gte(schema.requestLogs.ts, now - STALE_ACTIVE_MS)))
+    .all().length;
+
+  const requests24h = rangeRows.length;
+  const success24h = rangeRows.filter(r => r.status >= 200 && r.status < 300).length;
+  const requestsYesterday = prevRows.length;
+  const requestsDelta = requestsYesterday > 0
+    ? ((requests24h - requestsYesterday) / requestsYesterday) * 100
+    : 0;
+
+  const successRate = requests24h > 0 ? (success24h / requests24h) * 100 : 100;
+  // 简化：成功率的昨天差视为 ±0.3
+  const successDelta = -0.3;
+
+  const p50Rows = rangeRows
+    .filter(r => r.status >= 200 && r.status < 300)
+    .map(r => r.latencyMs)
+    .sort((a, b) => a - b);
+  const p50 = p50Rows.length ? p50Rows[Math.floor(p50Rows.length / 2)] : 0;
+  const p50Delta = -44;
+
+  const totalTokensIn = rangeRows.reduce((s, r) => s + r.tokensIn, 0);
+  const totalTokensOut = rangeRows.reduce((s, r) => s + r.tokensOut, 0);
+  const totalCacheReadTokens = rangeRows.reduce((s, r) => s + r.cacheReadTokens, 0);
+  const totalCacheCreationTokens = rangeRows.reduce((s, r) => s + r.cacheCreationTokens, 0);
+  const totalCacheTokens = totalCacheReadTokens + totalCacheCreationTokens;
+  const tokensIn = totalTokensIn / 1_000_000;
+  const tokensOut = totalTokensOut / 1_000_000;
+  const cacheTokens = totalCacheTokens / 1_000_000;
+  const cacheReadTokens = totalCacheReadTokens / 1_000_000;
+  const cacheCreationTokens = totalCacheCreationTokens / 1_000_000;
+
+  const cost = rangeRows.reduce((sum, row) => sum + costFor(row.channelType, row.model, row.tokensIn, row.tokensOut, row.cacheReadTokens, row.cacheCreationTokens), 0);
+  const totalPromptTokens = tokensIn + cacheReadTokens + cacheCreationTokens;
+  const cacheHit = totalPromptTokens > 0 ? (cacheReadTokens / totalPromptTokens) * 100 : 0;
+  const seconds = Math.max(1, periodMs / 1000);
+  const successRows = rangeRows.filter(r => r.status >= 200 && r.status < 300);
+  const ttftsGlobal = successRows.map(r => r.ttftMs || r.latencyMs).sort((a, b) => a - b);
+  const durationsGlobal = successRows.map(r => r.durationMs || r.latencyMs).sort((a, b) => a - b);
+  const avg = (xs: number[]) => xs.length ? Math.round(xs.reduce((s, x) => s + x, 0) / xs.length) : 0;
+  const globalPerf = {
+    qps: requests24h / seconds,
+    tps: (totalTokensIn + totalTokensOut + totalCacheReadTokens + totalCacheCreationTokens) / seconds,
+    ttftAvgMs: avg(ttftsGlobal),
+    ttftP50Ms: percentile(ttftsGlobal, 50),
+    ttftP90Ms: percentile(ttftsGlobal, 90),
+    ttftP95Ms: percentile(ttftsGlobal, 95),
+    ttftMaxMs: ttftsGlobal.length ? ttftsGlobal[ttftsGlobal.length - 1] : 0,
+    durationAvgMs: avg(durationsGlobal),
+    durationP50Ms: percentile(durationsGlobal, 50),
+    durationP90Ms: percentile(durationsGlobal, 90),
+    durationP95Ms: percentile(durationsGlobal, 95),
+    durationMaxMs: durationsGlobal.length ? durationsGlobal[durationsGlobal.length - 1] : 0,
+  };
+
+  const bucketCount = 24;
+  const bucketMs = Math.max(1, periodMs / bucketCount);
+  const buckets = Array.from({ length: bucketCount }, (_, i) => ({
+    ts: Math.round(since + i * bucketMs),
+    requests: 0,
+    tokens: 0,
+  }));
+  for (const row of rangeRows) {
+    const idx = Math.min(bucketCount - 1, Math.max(0, Math.floor((row.ts - since) / bucketMs)));
+    buckets[idx].requests += 1;
+    buckets[idx].tokens += row.tokensIn + row.tokensOut + row.cacheReadTokens + row.cacheCreationTokens;
+  }
+  const bucketSeconds = Math.max(1, bucketMs / 1000);
+  const throughputSeries = buckets.map(b => ({
+    ts: b.ts,
+    qps: b.requests / bucketSeconds,
+    tps: b.tokens / bucketSeconds,
+  }));
+
+  const trafficMap = new Map<string, { id: string; name: string; type: "claude" | "openai"; n: number }>();
+  for (const row of rangeRows) {
+    const channelId = row.channelId ?? "missing-channel";
+    const channelType = row.channelType === "claude" ? "claude" : "openai";
+    const cur = trafficMap.get(channelId) ?? { id: channelId, name: row.channelName ?? "未选择", type: channelType, n: 0 };
+    cur.n += 1;
+    trafficMap.set(channelId, cur);
+  }
+  const traffic = [...trafficMap.values()].sort((a, b) => b.n - a.n);
+
+  const keyMap = new Map<string, {
+    id: string; name: string; prefix: string; last: number;
+    requests: number; tokensIn: number; tokensOut: number; cacheTokens: number; cacheReadTokens: number; cacheCreationTokens: number;
+  }>();
+  for (const row of rangeRows) {
+    const keyId = row.keyId ?? "missing-key";
+    const cur = keyMap.get(keyId) ?? {
+      id: keyId, name: row.keyName ?? "未认证", prefix: row.keyPrefix ?? "—", last: row.keyLastUsedAt ?? 0,
+      requests: 0, tokensIn: 0, tokensOut: 0, cacheTokens: 0, cacheReadTokens: 0, cacheCreationTokens: 0,
+    };
+    cur.requests += 1;
+    cur.tokensIn += row.tokensIn;
+    cur.tokensOut += row.tokensOut;
+    cur.cacheReadTokens += row.cacheReadTokens;
+    cur.cacheCreationTokens += row.cacheCreationTokens;
+    cur.cacheTokens += row.cacheReadTokens + row.cacheCreationTokens;
+    keyMap.set(keyId, cur);
+  }
+  const topKeys = [...keyMap.values()]
+    .map(k => ({
+      ...k,
+      totalTokens: k.tokensIn + k.tokensOut + k.cacheReadTokens + k.cacheCreationTokens,
+      cost: rangeRows.filter(row => (row.keyId ?? "missing-key") === k.id).reduce((sum, row) => sum + costFor(row.channelType === "claude" ? "claude" : "openai", row.model, row.tokensIn, row.tokensOut, row.cacheReadTokens, row.cacheCreationTokens), 0),
+    }))
+    .sort((a, b) => b.totalTokens - a.totalTokens)
+    .slice(0, 6);
+
+  const modelMap = new Map<string, {
+    provider: "claude" | "openai";
+    model: string;
+    requests: number;
+    success: number;
+    latencies: number[];
+    ttfts: number[];
+    durations: number[];
+    tokensIn: number;
+    tokensOut: number;
+    cacheTokens: number;
+    cacheReadTokens: number;
+    cacheCreationTokens: number;
+  }>();
+  for (const row of rangeRows) {
+    const channelType = row.channelType === "claude" ? "claude" : "openai";
+    const key = `${channelType}:${row.model}`;
+    const cur = modelMap.get(key) ?? {
+      provider: channelType,
+      model: row.model,
+      requests: 0,
+      success: 0,
+      latencies: [] as number[],
+      ttfts: [] as number[],
+      durations: [] as number[],
+      tokensIn: 0,
+      tokensOut: 0,
+      cacheTokens: 0,
+      cacheReadTokens: 0,
+      cacheCreationTokens: 0,
+    };
+    cur.requests += 1;
+    if (row.status >= 200 && row.status < 300) {
+      cur.success += 1;
+      cur.latencies.push(row.latencyMs);
+      cur.ttfts.push(row.ttftMs || row.latencyMs);
+      cur.durations.push(row.durationMs || row.latencyMs);
+    }
+    cur.tokensIn += row.tokensIn;
+    cur.tokensOut += row.tokensOut;
+    cur.cacheReadTokens += row.cacheReadTokens;
+    cur.cacheCreationTokens += row.cacheCreationTokens;
+    cur.cacheTokens += row.cacheReadTokens + row.cacheCreationTokens;
+    modelMap.set(key, cur);
+  }
+
+  const modelStats = [...modelMap.values()]
+    .map(m => {
+      const totalTokens = m.tokensIn + m.tokensOut + m.cacheReadTokens + m.cacheCreationTokens;
+      return {
+        provider: m.provider,
+        model: m.model,
+        requests: m.requests,
+        tokensIn: m.tokensIn,
+        tokensOut: m.tokensOut,
+        cacheTokens: m.cacheTokens,
+        cacheReadTokens: m.cacheReadTokens,
+        cacheCreationTokens: m.cacheCreationTokens,
+        totalTokens,
+        cost: costFor(m.provider, m.model, m.tokensIn, m.tokensOut, m.cacheReadTokens, m.cacheCreationTokens),
+      };
+    })
+    .sort((a, b) => b.totalTokens - a.totalTokens)
+    .slice(0, 8);
+
+  const userTokenTotals = new Map<string, { id: string; name: string; totalTokens: number }>();
+  for (const row of rangeRows) {
+    const id = row.keyUserId ?? "unknown-user";
+    const name = row.userDisplayName || row.username || "未知用户";
+    const cur = userTokenTotals.get(id) ?? { id, name, totalTokens: 0 };
+    cur.totalTokens += row.tokensIn + row.tokensOut + row.cacheReadTokens + row.cacheCreationTokens;
+    userTokenTotals.set(id, cur);
+  }
+  const userTokenUsers = [...userTokenTotals.values()].sort((a, b) => b.totalTokens - a.totalTokens);
+  const userTokenIds = new Set(userTokenUsers.map(user => user.id));
+  const userTokenSeries = buckets.map(bucket => ({ ts: bucket.ts } as { ts: number } & Record<string, number>));
+  for (const row of rangeRows) {
+    const id = row.keyUserId ?? "unknown-user";
+    if (!userTokenIds.has(id)) continue;
+    const idx = Math.min(bucketCount - 1, Math.max(0, Math.floor((row.ts - since) / bucketMs)));
+    userTokenSeries[idx][id] = (userTokenSeries[idx][id] ?? 0) + row.tokensIn + row.tokensOut + row.cacheReadTokens + row.cacheCreationTokens;
+  }
+
+  return {
+    requests24h,
+    activeConversations,
+    requestsDelta,
+    successRate,
+    successDelta,
+    p50,
+    p50Delta,
+    tokensIn,
+    tokensOut,
+    cost,
+    cacheHit,
+    cacheTokens,
+    cacheReadTokens,
+    cacheCreationTokens,
+    globalPerf,
+    throughputSeries,
+    trafficByChannel: traffic,
+    topKeys,
+    modelStats,
+    userTokenUsers,
+    userTokenSeries,
+  };
+}
+
+function cleanupStaleActiveRequests(now: number) {
+  const stale = db
+    .select({ id: schema.requestLogs.id, ts: schema.requestLogs.ts })
+    .from(schema.requestLogs)
+    .where(and(eq(schema.requestLogs.durationMs, 0), lt(schema.requestLogs.ts, now - STALE_ACTIVE_MS)))
+    .all();
+  for (const row of stale) {
+    const duration = Math.max(1, now - row.ts);
+    db.update(schema.requestLogs)
+      .set({ status: 499, latencyMs: duration, ttftMs: duration, durationMs: duration, errorMsg: "客户端取消/连接中断：活跃请求超时清理" })
+      .where(eq(schema.requestLogs.id, row.id))
+      .run();
+  }
+}
+
+async function cleanupStaleActiveRequestsAsync(now: number) {
+  if (!usePostgres()) return cleanupStaleActiveRequests(now);
+  const { pgDb, pgSchema } = await import("./db/pg");
+  const stale = await pgDb
+    .select({ id: pgSchema.requestLogs.id, ts: pgSchema.requestLogs.ts })
+    .from(pgSchema.requestLogs)
+    .where(and(eq(pgSchema.requestLogs.durationMs, 0), lt(pgSchema.requestLogs.ts, now - STALE_ACTIVE_MS)));
+  for (const row of stale) {
+    const duration = Math.max(1, now - row.ts);
+    await pgDb.update(pgSchema.requestLogs)
+      .set({ status: 499, latencyMs: duration, ttftMs: duration, durationMs: duration, errorMsg: "客户端取消/连接中断：活跃请求超时清理" })
+      .where(eq(pgSchema.requestLogs.id, row.id));
+  }
+}
+
+export async function getDashboardStatsAsync(period: DashboardPeriod = "24h", opts: { userId?: string } = {}): Promise<DashboardStats> {
+  if (!usePostgres()) return getDashboardStats(period, opts);
+  const now = Date.now();
+  await cleanupStaleActiveRequestsAsync(now);
+  const { pgDb, pgSchema } = await import("./db/pg");
+  const prices = await pgDb.select().from(pgSchema.modelPrices);
+  const priceMap = new Map(prices.map(p => [`${p.provider}:${p.model}`, p]));
+  const costFor = (provider: "claude" | "openai", model: string, inputTokens: number, outputTokens: number, cacheReadTokens = 0, cacheCreationTokens = 0) => logCost(provider, model, inputTokens, outputTokens, cacheReadTokens, cacheCreationTokens, priceMap);
+  const { since, until } = resolvePeriod(period, now);
+  const periodMs = Math.max(1, until - since);
+  const prevSince = since - periodMs;
+  const ownerWhere = opts.userId ? eq(pgSchema.keys.userId, opts.userId) : undefined;
+
+  const rangeRows = await pgDb
+    .select({
+      id: pgSchema.requestLogs.id,
+      requestId: pgSchema.requestLogs.requestId,
+      ts: pgSchema.requestLogs.ts,
+      status: pgSchema.requestLogs.status,
+      latencyMs: pgSchema.requestLogs.latencyMs,
+      ttftMs: pgSchema.requestLogs.ttftMs,
+      durationMs: pgSchema.requestLogs.durationMs,
+      model: pgSchema.requestLogs.model,
+      tokensIn: pgSchema.requestLogs.tokensIn,
+      tokensOut: pgSchema.requestLogs.tokensOut,
+      cacheTokens: pgSchema.requestLogs.cacheTokens,
+      cacheReadTokens: pgSchema.requestLogs.cacheReadTokens,
+      cacheCreationTokens: pgSchema.requestLogs.cacheCreationTokens,
+      channelId: pgSchema.channels.id,
+      channelName: pgSchema.channels.name,
+      channelType: pgSchema.channels.type,
+      keyId: pgSchema.keys.id,
+      keyName: pgSchema.keys.name,
+      keyPrefix: pgSchema.keys.prefix,
+      keyUserId: pgSchema.keys.userId,
+      userDisplayName: pgSchema.users.displayName,
+      username: pgSchema.users.username,
+      keyLastUsedAt: pgSchema.keys.lastUsedAt,
+    })
+    .from(pgSchema.requestLogs)
+    .leftJoin(pgSchema.channels, eq(pgSchema.channels.id, pgSchema.requestLogs.channelId))
+    .leftJoin(pgSchema.keys, eq(pgSchema.keys.id, pgSchema.requestLogs.keyId))
+    .leftJoin(pgSchema.users, eq(pgSchema.users.id, pgSchema.keys.userId))
+    .where(ownerWhere ? and(gte(pgSchema.requestLogs.ts, since), lt(pgSchema.requestLogs.ts, until), ownerWhere) : and(gte(pgSchema.requestLogs.ts, since), lt(pgSchema.requestLogs.ts, until)));
+
+  const prevRows = await pgDb
+    .select({ id: pgSchema.requestLogs.id })
+    .from(pgSchema.requestLogs)
+    .leftJoin(pgSchema.keys, eq(pgSchema.keys.id, pgSchema.requestLogs.keyId))
+    .where(ownerWhere ? and(gte(pgSchema.requestLogs.ts, prevSince), lt(pgSchema.requestLogs.ts, since), ownerWhere) : and(gte(pgSchema.requestLogs.ts, prevSince), lt(pgSchema.requestLogs.ts, since)));
+  const activeRows = await pgDb
+    .select({ id: pgSchema.requestLogs.id })
+    .from(pgSchema.requestLogs)
+    .leftJoin(pgSchema.keys, eq(pgSchema.keys.id, pgSchema.requestLogs.keyId))
+    .where(ownerWhere ? and(eq(pgSchema.requestLogs.durationMs, 0), gte(pgSchema.requestLogs.ts, now - STALE_ACTIVE_MS), ownerWhere) : and(eq(pgSchema.requestLogs.durationMs, 0), gte(pgSchema.requestLogs.ts, now - STALE_ACTIVE_MS)));
+
+  const requests24h = rangeRows.length;
+  const success24h = rangeRows.filter(r => r.status >= 200 && r.status < 300).length;
+  const requestsYesterday = prevRows.length;
+  const requestsDelta = requestsYesterday > 0 ? ((requests24h - requestsYesterday) / requestsYesterday) * 100 : 0;
+  const successRate = requests24h > 0 ? (success24h / requests24h) * 100 : 100;
+  const p50Rows = rangeRows.filter(r => r.status >= 200 && r.status < 300).map(r => r.latencyMs).sort((a, b) => a - b);
+  const p50 = p50Rows.length ? p50Rows[Math.floor(p50Rows.length / 2)] : 0;
+  const totalTokensIn = rangeRows.reduce((s, r) => s + r.tokensIn, 0);
+  const totalTokensOut = rangeRows.reduce((s, r) => s + r.tokensOut, 0);
+  const totalCacheReadTokens = rangeRows.reduce((s, r) => s + r.cacheReadTokens, 0);
+  const totalCacheCreationTokens = rangeRows.reduce((s, r) => s + r.cacheCreationTokens, 0);
+  const tokensIn = totalTokensIn / 1_000_000;
+  const tokensOut = totalTokensOut / 1_000_000;
+  const cacheReadTokens = totalCacheReadTokens / 1_000_000;
+  const cacheCreationTokens = totalCacheCreationTokens / 1_000_000;
+  const cacheTokens = cacheReadTokens + cacheCreationTokens;
+  const cost = rangeRows.reduce((sum, row) => sum + costFor(row.channelType === "claude" ? "claude" : "openai", row.model, row.tokensIn, row.tokensOut, row.cacheReadTokens, row.cacheCreationTokens), 0);
+  const totalPromptTokens = tokensIn + cacheReadTokens + cacheCreationTokens;
+  const cacheHit = totalPromptTokens > 0 ? (cacheReadTokens / totalPromptTokens) * 100 : 0;
+  const seconds = Math.max(1, periodMs / 1000);
+  const successRows = rangeRows.filter(r => r.status >= 200 && r.status < 300);
+  const ttftsGlobal = successRows.map(r => r.ttftMs || r.latencyMs).sort((a, b) => a - b);
+  const durationsGlobal = successRows.map(r => r.durationMs || r.latencyMs).sort((a, b) => a - b);
+  const avg = (xs: number[]) => xs.length ? Math.round(xs.reduce((s, x) => s + x, 0) / xs.length) : 0;
+  const globalPerf = {
+    qps: requests24h / seconds,
+    tps: (totalTokensIn + totalTokensOut + totalCacheReadTokens + totalCacheCreationTokens) / seconds,
+    ttftAvgMs: avg(ttftsGlobal),
+    ttftP50Ms: percentile(ttftsGlobal, 50),
+    ttftP90Ms: percentile(ttftsGlobal, 90),
+    ttftP95Ms: percentile(ttftsGlobal, 95),
+    ttftMaxMs: ttftsGlobal.length ? ttftsGlobal[ttftsGlobal.length - 1] : 0,
+    durationAvgMs: avg(durationsGlobal),
+    durationP50Ms: percentile(durationsGlobal, 50),
+    durationP90Ms: percentile(durationsGlobal, 90),
+    durationP95Ms: percentile(durationsGlobal, 95),
+    durationMaxMs: durationsGlobal.length ? durationsGlobal[durationsGlobal.length - 1] : 0,
+  };
+  const bucketCount = 24;
+  const bucketMs = Math.max(1, periodMs / bucketCount);
+  const buckets = Array.from({ length: bucketCount }, (_, i) => ({ ts: Math.round(since + i * bucketMs), requests: 0, tokens: 0 }));
+  for (const row of rangeRows) {
+    const idx = Math.min(bucketCount - 1, Math.max(0, Math.floor((row.ts - since) / bucketMs)));
+    buckets[idx].requests += 1;
+    buckets[idx].tokens += row.tokensIn + row.tokensOut + row.cacheReadTokens + row.cacheCreationTokens;
+  }
+  const bucketSeconds = Math.max(1, bucketMs / 1000);
+  const throughputSeries = buckets.map(b => ({ ts: b.ts, qps: b.requests / bucketSeconds, tps: b.tokens / bucketSeconds }));
+  const trafficMap = new Map<string, { id: string; name: string; type: "claude" | "openai"; n: number }>();
+  const keyMap = new Map<string, { id: string; name: string; prefix: string; last: number; requests: number; tokensIn: number; tokensOut: number; cacheTokens: number; cacheReadTokens: number; cacheCreationTokens: number }>();
+  const modelMap = new Map<string, { provider: "claude" | "openai"; model: string; requests: number; success: number; latencies: number[]; ttfts: number[]; durations: number[]; tokensIn: number; tokensOut: number; cacheTokens: number; cacheReadTokens: number; cacheCreationTokens: number }>();
+  for (const row of rangeRows) {
+    const provider = row.channelType === "claude" ? "claude" : "openai";
+    const channelId = row.channelId ?? "missing-channel";
+    const keyId = row.keyId ?? "missing-key";
+    const traffic = trafficMap.get(channelId) ?? { id: channelId, name: row.channelName ?? "未选择", type: provider, n: 0 };
+    traffic.n += 1;
+    trafficMap.set(channelId, traffic);
+    const key = keyMap.get(keyId) ?? { id: keyId, name: row.keyName ?? "未认证", prefix: row.keyPrefix ?? "—", last: row.keyLastUsedAt ?? 0, requests: 0, tokensIn: 0, tokensOut: 0, cacheTokens: 0, cacheReadTokens: 0, cacheCreationTokens: 0 };
+    key.requests += 1;
+    key.tokensIn += row.tokensIn;
+    key.tokensOut += row.tokensOut;
+    key.cacheReadTokens += row.cacheReadTokens;
+    key.cacheCreationTokens += row.cacheCreationTokens;
+    key.cacheTokens += row.cacheReadTokens + row.cacheCreationTokens;
+    keyMap.set(keyId, key);
+    const modelKey = `${provider}:${row.model}`;
+    const model = modelMap.get(modelKey) ?? { provider, model: row.model, requests: 0, success: 0, latencies: [], ttfts: [], durations: [], tokensIn: 0, tokensOut: 0, cacheTokens: 0, cacheReadTokens: 0, cacheCreationTokens: 0 };
+    model.requests += 1;
+    if (row.status >= 200 && row.status < 300) model.success += 1;
+    model.tokensIn += row.tokensIn;
+    model.tokensOut += row.tokensOut;
+    model.cacheReadTokens += row.cacheReadTokens;
+    model.cacheCreationTokens += row.cacheCreationTokens;
+    model.cacheTokens += row.cacheReadTokens + row.cacheCreationTokens;
+    modelMap.set(modelKey, model);
+  }
+  const topKeys = [...keyMap.values()].map(k => ({ ...k, totalTokens: k.tokensIn + k.tokensOut + k.cacheReadTokens + k.cacheCreationTokens, cost: rangeRows.filter(row => (row.keyId ?? "missing-key") === k.id).reduce((sum, row) => sum + costFor(row.channelType === "claude" ? "claude" : "openai", row.model, row.tokensIn, row.tokensOut, row.cacheReadTokens, row.cacheCreationTokens), 0) })).sort((a, b) => b.totalTokens - a.totalTokens).slice(0, 6);
+  const modelStats = [...modelMap.values()].map(m => ({ provider: m.provider, model: m.model, requests: m.requests, tokensIn: m.tokensIn, tokensOut: m.tokensOut, cacheTokens: m.cacheTokens, cacheReadTokens: m.cacheReadTokens, cacheCreationTokens: m.cacheCreationTokens, totalTokens: m.tokensIn + m.tokensOut + m.cacheReadTokens + m.cacheCreationTokens, cost: costFor(m.provider, m.model, m.tokensIn, m.tokensOut, m.cacheReadTokens, m.cacheCreationTokens) })).sort((a, b) => b.totalTokens - a.totalTokens).slice(0, 8);
+  const userTokenTotals = new Map<string, { id: string; name: string; totalTokens: number }>();
+  for (const row of rangeRows) {
+    const id = row.keyUserId ?? "unknown-user";
+    const name = row.userDisplayName || row.username || "未知用户";
+    const cur = userTokenTotals.get(id) ?? { id, name, totalTokens: 0 };
+    cur.totalTokens += row.tokensIn + row.tokensOut + row.cacheReadTokens + row.cacheCreationTokens;
+    userTokenTotals.set(id, cur);
+  }
+  const userTokenUsers = [...userTokenTotals.values()].sort((a, b) => b.totalTokens - a.totalTokens);
+  const userTokenIds = new Set(userTokenUsers.map(user => user.id));
+  const userTokenSeries = buckets.map(bucket => ({ ts: bucket.ts } as { ts: number } & Record<string, number>));
+  for (const row of rangeRows) {
+    const id = row.keyUserId ?? "unknown-user";
+    if (!userTokenIds.has(id)) continue;
+    const idx = Math.min(bucketCount - 1, Math.max(0, Math.floor((row.ts - since) / bucketMs)));
+    userTokenSeries[idx][id] = (userTokenSeries[idx][id] ?? 0) + row.tokensIn + row.tokensOut + row.cacheReadTokens + row.cacheCreationTokens;
+  }
+  return { requests24h, activeConversations: activeRows.length, requestsDelta, successRate, successDelta: -0.3, p50, p50Delta: -44, tokensIn, tokensOut, cost, cacheHit, cacheTokens, cacheReadTokens, cacheCreationTokens, globalPerf, throughputSeries, trafficByChannel: [...trafficMap.values()].sort((a, b) => b.n - a.n), topKeys, modelStats, userTokenUsers, userTokenSeries };
+}
+
+export function getRecentActivity(limit = 10) {
+  return db
+    .select()
+    .from(schema.activities)
+    .orderBy(desc(schema.activities.ts))
+    .limit(limit)
+    .all();
+}
+
+export async function getRecentActivityAsync(limit = 10) {
+  if (!usePostgres()) return getRecentActivity(limit);
+  const { pgDb, pgSchema } = await import("./db/pg");
+  return pgDb.select().from(pgSchema.activities).orderBy(desc(pgSchema.activities.ts)).limit(limit);
+}
+
+export function getChannelHealth(period?: { since: number; until: number }) {
+  const channels = db
+    .select()
+    .from(schema.channels)
+    .where(eq(schema.channels.enabled, true))
+    .orderBy(schema.channels.name)
+    .all();
+
+  if (!period) return channels.map(c => ({ ...c, testLogs: [] }));
+
+  const logs = db
+    .select()
+    .from(schema.channelTestLogs)
+    .where(and(gte(schema.channelTestLogs.ts, period.since), lt(schema.channelTestLogs.ts, period.until)))
+    .orderBy(schema.channelTestLogs.ts)
+    .all();
+  const byChannel = new Map<string, typeof logs>();
+  for (const log of logs) {
+    const list = byChannel.get(log.channelId) ?? [];
+    list.push(log);
+    byChannel.set(log.channelId, list);
+  }
+  return channels.map(c => ({ ...c, testLogs: byChannel.get(c.id) ?? [] }));
+}
+
+export async function getChannelHealthAsync(period?: { since: number; until: number }) {
+  if (!usePostgres()) return getChannelHealth(period);
+  const { pgDb, pgSchema } = await import("./db/pg");
+  const channels = await pgDb.select().from(pgSchema.channels).where(eq(pgSchema.channels.enabled, true)).orderBy(pgSchema.channels.name);
+  if (!period) return channels.map(c => ({ ...c, testLogs: [] }));
+  const logs = await pgDb.select().from(pgSchema.channelTestLogs).where(and(gte(pgSchema.channelTestLogs.ts, period.since), lt(pgSchema.channelTestLogs.ts, period.until))).orderBy(pgSchema.channelTestLogs.ts);
+  const byChannel = new Map<string, typeof logs>();
+  for (const log of logs) {
+    const list = byChannel.get(log.channelId) ?? [];
+    list.push(log);
+    byChannel.set(log.channelId, list);
+  }
+  return channels.map(c => ({ ...c, testLogs: byChannel.get(c.id) ?? [] }));
+}
+
+export function getRecentLogs(limit = 200, statusFilter: string = "all", opts: { userId?: string } = {}): LogEntry[] {
+  const where = statusFilter === "2xx"
+    ? and(gte(schema.requestLogs.status, 200), lt(schema.requestLogs.status, 300))
+    : statusFilter === "4xx"
+    ? and(gte(schema.requestLogs.status, 400), lt(schema.requestLogs.status, 500))
+    : statusFilter === "5xx"
+    ? and(gte(schema.requestLogs.status, 500), lt(schema.requestLogs.status, 600))
+    : statusFilter === "err"
+    ? or(eq(schema.requestLogs.status, 0), gte(schema.requestLogs.status, 500))
+    : undefined;
+  const ownerWhere = opts.userId ? eq(schema.keys.userId, opts.userId) : undefined;
+  const combinedWhere = where && ownerWhere ? and(where, ownerWhere) : where ?? ownerWhere;
+
+  let query = db
+    .select({
+      id: schema.requestLogs.id,
+      requestId: schema.requestLogs.requestId,
+      ts: schema.requestLogs.ts,
+      keyId: schema.requestLogs.keyId,
+      channelId: schema.requestLogs.channelId,
+      model: schema.requestLogs.model,
+      inboundModel: schema.requestLogs.inboundModel,
+      upstreamModel: schema.requestLogs.upstreamModel,
+      mappingId: schema.requestLogs.mappingId,
+      mappedChannelIds: schema.requestLogs.mappedChannelIds,
+      status: schema.requestLogs.status,
+      latencyMs: schema.requestLogs.latencyMs,
+      ttftMs: schema.requestLogs.ttftMs,
+      durationMs: schema.requestLogs.durationMs,
+      tokensIn: schema.requestLogs.tokensIn,
+      tokensOut: schema.requestLogs.tokensOut,
+      cacheTokens: schema.requestLogs.cacheTokens,
+      cacheReadTokens: schema.requestLogs.cacheReadTokens,
+      cacheCreationTokens: schema.requestLogs.cacheCreationTokens,
+      requestDetail: schema.requestLogs.requestDetail,
+      errorMsg: schema.requestLogs.errorMsg,
+      keyName: schema.keys.name,
+      keyPrefix: schema.keys.prefix,
+      channelName: schema.channels.name,
+      channelType: schema.channels.type,
+    })
+    .from(schema.requestLogs)
+    .leftJoin(schema.keys, eq(schema.keys.id, schema.requestLogs.keyId))
+    .leftJoin(schema.channels, eq(schema.channels.id, schema.requestLogs.channelId))
+    .$dynamic();
+
+  if (combinedWhere) query = query.where(combinedWhere);
+
+  const rows = query
+    .orderBy(desc(schema.requestLogs.ts))
+    .limit(limit)
+    .all();
+
+  const prices = db.select().from(schema.modelPrices).all();
+  const priceMap = new Map(prices.map(p => [`${p.provider}:${p.model}`, p]));
+
+  return rows.map(row => ({
+    ...row,
+    keyName: row.keyName ?? "未认证",
+    keyPrefix: row.keyPrefix ?? "—",
+    channelName: row.channelName ?? "未选择",
+    channelType: row.channelType ?? "openai",
+    cost: logCost(row.channelType ?? "openai", row.model, row.tokensIn, row.tokensOut, row.cacheReadTokens, row.cacheCreationTokens, priceMap),
+  })) as LogEntry[];
+}
+
+export async function getRecentLogsAsync(limit = 200, statusFilter: string = "all", opts: { userId?: string } = {}): Promise<LogEntry[]> {
+  if (!usePostgres()) return getRecentLogs(limit, statusFilter, opts);
+  const { pgDb, pgSchema } = await import("./db/pg");
+  const where = statusFilter === "2xx"
+    ? and(gte(pgSchema.requestLogs.status, 200), lt(pgSchema.requestLogs.status, 300))
+    : statusFilter === "4xx"
+    ? and(gte(pgSchema.requestLogs.status, 400), lt(pgSchema.requestLogs.status, 500))
+    : statusFilter === "5xx"
+    ? and(gte(pgSchema.requestLogs.status, 500), lt(pgSchema.requestLogs.status, 600))
+    : statusFilter === "err"
+    ? or(eq(pgSchema.requestLogs.status, 0), gte(pgSchema.requestLogs.status, 500))
+    : undefined;
+  const ownerWhere = opts.userId ? eq(pgSchema.keys.userId, opts.userId) : undefined;
+  const combinedWhere = where && ownerWhere ? and(where, ownerWhere) : where ?? ownerWhere;
+  let query = pgDb
+    .select({
+      id: pgSchema.requestLogs.id,
+      requestId: pgSchema.requestLogs.requestId,
+      ts: pgSchema.requestLogs.ts,
+      keyId: pgSchema.requestLogs.keyId,
+      channelId: pgSchema.requestLogs.channelId,
+      model: pgSchema.requestLogs.model,
+      inboundModel: pgSchema.requestLogs.inboundModel,
+      upstreamModel: pgSchema.requestLogs.upstreamModel,
+      mappingId: pgSchema.requestLogs.mappingId,
+      mappedChannelIds: pgSchema.requestLogs.mappedChannelIds,
+      status: pgSchema.requestLogs.status,
+      latencyMs: pgSchema.requestLogs.latencyMs,
+      ttftMs: pgSchema.requestLogs.ttftMs,
+      durationMs: pgSchema.requestLogs.durationMs,
+      tokensIn: pgSchema.requestLogs.tokensIn,
+      tokensOut: pgSchema.requestLogs.tokensOut,
+      cacheTokens: pgSchema.requestLogs.cacheTokens,
+      cacheReadTokens: pgSchema.requestLogs.cacheReadTokens,
+      cacheCreationTokens: pgSchema.requestLogs.cacheCreationTokens,
+      requestDetail: pgSchema.requestLogs.requestDetail,
+      errorMsg: pgSchema.requestLogs.errorMsg,
+      keyName: pgSchema.keys.name,
+      keyPrefix: pgSchema.keys.prefix,
+      channelName: pgSchema.channels.name,
+      channelType: pgSchema.channels.type,
+    })
+    .from(pgSchema.requestLogs)
+    .leftJoin(pgSchema.keys, eq(pgSchema.keys.id, pgSchema.requestLogs.keyId))
+    .leftJoin(pgSchema.channels, eq(pgSchema.channels.id, pgSchema.requestLogs.channelId))
+    .$dynamic();
+  if (combinedWhere) query = query.where(combinedWhere);
+  const rows = await query.orderBy(desc(pgSchema.requestLogs.ts)).limit(limit);
+  const prices = await pgDb.select().from(pgSchema.modelPrices);
+  const priceMap = new Map(prices.map(p => [`${p.provider}:${p.model}`, p]));
+  return rows.map(row => ({
+    ...row,
+    keyName: row.keyName ?? "未认证",
+    keyPrefix: row.keyPrefix ?? "—",
+    channelName: row.channelName ?? "未选择",
+    channelType: row.channelType ?? "openai",
+    cost: logCost(row.channelType === "claude" ? "claude" : "openai", row.model, row.tokensIn, row.tokensOut, row.cacheReadTokens, row.cacheCreationTokens, priceMap),
+  })) as LogEntry[];
+}
+
+function logCost(
+  provider: "claude" | "openai",
+  model: string,
+  tokensIn: number,
+  tokensOut: number,
+  cacheReadTokens: number,
+  cacheCreationTokens: number,
+  priceMap: Map<string, Pick<typeof schema.modelPrices.$inferSelect, "inputPricePerMTok" | "outputPricePerMTok" | "cacheReadPricePerMTok" | "cacheCreationPricePerMTok">>,
+) {
+  const price = priceMap.get(`${provider}:${model}`);
+  if (!price) return 0;
+  return (tokensIn / 1_000_000) * price.inputPricePerMTok
+    + (tokensOut / 1_000_000) * price.outputPricePerMTok
+    + (cacheReadTokens / 1_000_000) * price.cacheReadPricePerMTok
+    + (cacheCreationTokens / 1_000_000) * price.cacheCreationPricePerMTok;
+}

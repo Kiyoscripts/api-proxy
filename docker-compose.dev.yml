@@ -1,0 +1,77 @@
+name: api-proxy
+
+services:
+  app:
+    profiles: ["app"]
+    build:
+      context: .
+      dockerfile: Dockerfile.dev
+    image: api-proxy-dev:latest
+    working_dir: /app
+    command: ["sh", "-lc", "bun install --frozen-lockfile && node node_modules/next/dist/bin/next dev -p 3000 -H 0.0.0.0"]
+    ports:
+      - "3000:3000"
+    environment:
+      NODE_ENV: development
+      NEXT_TELEMETRY_DISABLED: "1"
+      PORT: 3000
+      HOSTNAME: 0.0.0.0
+      DATABASE_URL: postgres://api_proxy:${POSTGRES_PASSWORD:-api_proxy_dev_password}@postgres:5432/api_proxy
+      DATABASE_POOL_SIZE: 10
+      APP_SECRET: ${APP_SECRET:-api-proxy-dev-secret-change-me}
+      REDIS_URL: redis://redis:6379
+      EMAIL_VERIFY_SECRET: ${EMAIL_VERIFY_SECRET:-api-proxy-dev-email-secret-change-me}
+      CHOKIDAR_USEPOLLING: "true"
+      WATCHPACK_POLLING: "true"
+    volumes:
+      - .:/app
+      - app_node_modules:/app/node_modules
+      - app_next:/app/.next
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "node", "-e", "fetch('http://127.0.0.1:3000/api/health').then(r => { if (!r.ok) process.exit(1) }).catch(() => process.exit(1))"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 30s
+
+  postgres:
+    image: postgres:16-alpine
+    restart: unless-stopped
+    ports:
+      - "5432:5432"
+    environment:
+      POSTGRES_DB: api_proxy
+      POSTGRES_USER: api_proxy
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-api_proxy_dev_password}
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U api_proxy -d api_proxy"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  redis:
+    image: redis:7-alpine
+    restart: unless-stopped
+    ports:
+      - "6379:6379"
+    command: ["redis-server", "--appendonly", "yes", "--maxmemory-policy", "noeviction"]
+    volumes:
+      - redis_data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 3s
+      retries: 5
+
+volumes:
+  app_node_modules:
+  app_next:
+  postgres_data:
+  redis_data:

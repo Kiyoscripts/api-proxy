@@ -1,0 +1,62 @@
+name: api-proxy
+
+services:
+  api-proxy:
+    image: registry.cn-shanghai.aliyuncs.com/ai_studio/api-proxy:v0.0.4
+    restart: unless-stopped
+    ports:
+      - "3000:3000"
+    environment:
+      NODE_ENV: production
+      PORT: 3000
+      HOSTNAME: 0.0.0.0
+      DATABASE_URL: postgres://api_proxy:${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD in .env}@postgres:5432/api_proxy
+      DATABASE_POOL_SIZE: 20
+      APP_SECRET: ${APP_SECRET:?set APP_SECRET in .env}
+      REDIS_URL: redis://redis:6379
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    ulimits:
+      nofile:
+        soft: 65535
+        hard: 65535
+    healthcheck:
+      test: ["CMD", "node", "-e", "fetch('http://127.0.0.1:3000/api/health').then(r => { if (!r.ok) process.exit(1) }).catch(() => process.exit(1))"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 20s
+
+  redis:
+    image: redis:7-alpine
+    restart: unless-stopped
+    command: ["redis-server", "--appendonly", "yes", "--maxmemory-policy", "noeviction"]
+    volumes:
+      - api_proxy_redis:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 3s
+      retries: 5
+
+  postgres:
+    image: postgres:16-alpine
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: api_proxy
+      POSTGRES_USER: api_proxy
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD in .env}
+    volumes:
+      - api_proxy_postgres:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U api_proxy -d api_proxy"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+volumes:
+  api_proxy_redis:
+  api_proxy_postgres:

@@ -1,0 +1,233 @@
+import postgres from "postgres";
+
+const url = process.env.DATABASE_URL;
+if (!url) {
+  throw new Error("DATABASE_URL is required");
+}
+
+const requiredTables = [
+  "users",
+  "user_quotas",
+  "keys",
+  "channels",
+  "request_logs",
+  "activities",
+  "channel_test_logs",
+  "model_mappings",
+  "model_catalog",
+  "settings",
+  "model_prices",
+  "email_verifications",
+  "gift_cards",
+];
+
+const statements = [
+  `CREATE TABLE IF NOT EXISTS users (
+    id text PRIMARY KEY,
+    username text NOT NULL UNIQUE,
+    display_name text NOT NULL,
+    email text NOT NULL DEFAULT '',
+    password_hash text NOT NULL DEFAULT '',
+    role text NOT NULL DEFAULT 'user',
+    status text NOT NULL DEFAULT 'active',
+    created_at bigint NOT NULL,
+    updated_at bigint NOT NULL
+  )`,
+  `CREATE TABLE IF NOT EXISTS user_quotas (
+    id text PRIMARY KEY,
+    user_id text NOT NULL UNIQUE,
+    daily_quota_tokens integer NOT NULL DEFAULT 0,
+    monthly_quota_tokens integer NOT NULL DEFAULT 0,
+    daily_used_tokens integer NOT NULL DEFAULT 0,
+    monthly_used_tokens integer NOT NULL DEFAULT 0,
+    daily_quota_usd real NOT NULL DEFAULT 0,
+    monthly_quota_usd real NOT NULL DEFAULT 0,
+    daily_used_usd real NOT NULL DEFAULT 0,
+    monthly_used_usd real NOT NULL DEFAULT 0,
+    quota_usd real NOT NULL DEFAULT 0,
+    used_usd real NOT NULL DEFAULT 0,
+    rate_limit_rpm integer NOT NULL DEFAULT 0,
+    rate_limit_tpm integer NOT NULL DEFAULT 0,
+    max_concurrency integer NOT NULL DEFAULT 0,
+    reset_daily_at bigint NOT NULL DEFAULT 0,
+    reset_monthly_at bigint NOT NULL DEFAULT 0,
+    created_at bigint NOT NULL,
+    updated_at bigint NOT NULL
+  )`,
+  `CREATE TABLE IF NOT EXISTS keys (
+    id text PRIMARY KEY,
+    name text NOT NULL UNIQUE,
+    user_id text NOT NULL DEFAULT '',
+    prefix text NOT NULL,
+    full_key text NOT NULL,
+    channel_scope text NOT NULL DEFAULT 'all',
+    status text NOT NULL DEFAULT 'active',
+    quota integer NOT NULL DEFAULT 0,
+    rate_limit_rpm integer NOT NULL DEFAULT 0,
+    rate_limit_tpm integer NOT NULL DEFAULT 0,
+    max_concurrency integer NOT NULL DEFAULT 0,
+    used real NOT NULL DEFAULT 0,
+    created_at bigint NOT NULL,
+    last_used_at bigint
+  )`,
+  `CREATE TABLE IF NOT EXISTS channels (
+    id text PRIMARY KEY,
+    name text NOT NULL UNIQUE,
+    type text NOT NULL,
+    base_url text NOT NULL,
+    api_key text NOT NULL,
+    weight integer NOT NULL DEFAULT 1,
+    max_concurrency integer NOT NULL DEFAULT 0,
+    monitor_interval_sec integer NOT NULL DEFAULT 0,
+    test_model text NOT NULL DEFAULT '',
+    models text[] NOT NULL DEFAULT '{}',
+    status text NOT NULL DEFAULT 'ok',
+    p50_ms integer NOT NULL DEFAULT 0,
+    err_rate real NOT NULL DEFAULT 0,
+    enabled boolean NOT NULL DEFAULT true
+  )`,
+  `CREATE TABLE IF NOT EXISTS request_logs (
+    id serial PRIMARY KEY,
+    request_id text NOT NULL DEFAULT '',
+    ts bigint NOT NULL,
+    key_id text NOT NULL,
+    channel_id text NOT NULL,
+    model text NOT NULL,
+    inbound_model text NOT NULL DEFAULT '',
+    upstream_model text NOT NULL DEFAULT '',
+    mapping_id text NOT NULL DEFAULT '',
+    mapped_channel_ids text[] NOT NULL DEFAULT '{}',
+    status integer NOT NULL,
+    latency_ms integer NOT NULL,
+    ttft_ms integer NOT NULL DEFAULT 0,
+    duration_ms integer NOT NULL DEFAULT 0,
+    tokens_in integer NOT NULL DEFAULT 0,
+    tokens_out integer NOT NULL DEFAULT 0,
+    cache_tokens integer NOT NULL DEFAULT 0,
+    cache_read_tokens integer NOT NULL DEFAULT 0,
+    cache_creation_tokens integer NOT NULL DEFAULT 0,
+    request_detail text,
+    error_msg text
+  )`,
+  `CREATE TABLE IF NOT EXISTS activities (
+    id serial PRIMARY KEY,
+    ts bigint NOT NULL,
+    event text NOT NULL,
+    actor text NOT NULL
+  )`,
+  `CREATE TABLE IF NOT EXISTS channel_test_logs (
+    id serial PRIMARY KEY,
+    channel_id text NOT NULL,
+    ts bigint NOT NULL,
+    ok boolean NOT NULL,
+    latency_ms integer NOT NULL DEFAULT 0,
+    error_msg text
+  )`,
+  `CREATE TABLE IF NOT EXISTS model_mappings (
+    id text PRIMARY KEY,
+    provider text NOT NULL,
+    inbound_model text NOT NULL,
+    upstream_model text NOT NULL,
+    channel_ids text[] NOT NULL DEFAULT '{}',
+    created_at bigint NOT NULL
+  )`,
+  `CREATE UNIQUE INDEX IF NOT EXISTS model_mappings_provider_inbound_unique ON model_mappings (provider, inbound_model)`,
+  `CREATE TABLE IF NOT EXISTS model_catalog (
+    id text PRIMARY KEY,
+    provider text NOT NULL,
+    model text NOT NULL,
+    display_name text NOT NULL DEFAULT '',
+    upstream_model text NOT NULL DEFAULT '',
+    visible boolean NOT NULL DEFAULT true,
+    enabled boolean NOT NULL DEFAULT true,
+    created_at bigint NOT NULL,
+    updated_at bigint NOT NULL
+  )`,
+  `CREATE UNIQUE INDEX IF NOT EXISTS model_catalog_provider_model_unique ON model_catalog (provider, model)`,
+  `CREATE TABLE IF NOT EXISTS settings (
+    key text PRIMARY KEY,
+    value text NOT NULL,
+    updated_at bigint NOT NULL
+  )`,
+  `CREATE TABLE IF NOT EXISTS model_prices (
+    id text PRIMARY KEY,
+    provider text NOT NULL,
+    model text NOT NULL,
+    input_price_per_mtok real NOT NULL DEFAULT 0,
+    output_price_per_mtok real NOT NULL DEFAULT 0,
+    cache_read_price_per_mtok real NOT NULL DEFAULT 0,
+    cache_creation_price_per_mtok real NOT NULL DEFAULT 0,
+    updated_at bigint NOT NULL
+  )`,
+  `CREATE UNIQUE INDEX IF NOT EXISTS model_prices_provider_model_unique ON model_prices (provider, model)`,
+  `CREATE TABLE IF NOT EXISTS email_verifications (
+    id text PRIMARY KEY,
+    user_id text NOT NULL,
+    email text NOT NULL,
+    code_hash text NOT NULL,
+    token_hash text NOT NULL,
+    purpose text NOT NULL DEFAULT 'register',
+    expires_at bigint NOT NULL,
+    used_at bigint,
+    attempts integer NOT NULL DEFAULT 0,
+    created_at bigint NOT NULL
+  )`,
+  `CREATE TABLE IF NOT EXISTS gift_cards (
+    id text PRIMARY KEY,
+    code_hash text NOT NULL UNIQUE,
+    code_prefix text NOT NULL,
+    code_suffix text NOT NULL,
+    amount_usd real NOT NULL,
+    status text NOT NULL DEFAULT 'active',
+    created_by text NOT NULL,
+    redeemed_by text,
+    redeemed_at bigint,
+    created_at bigint NOT NULL
+  )`,
+];
+
+const sql = postgres(url, { max: 1 });
+
+async function waitForDatabase(retries = 30) {
+  for (let attempt = 1; attempt <= retries; attempt += 1) {
+    try {
+      await sql`select 1`;
+      return;
+    } catch (error) {
+      if (attempt === retries) throw error;
+      await new Promise(resolve => setTimeout(resolve, 1000));
+    }
+  }
+}
+
+async function existingTables() {
+  const rows = await sql`
+    select table_name
+    from information_schema.tables
+    where table_schema = 'public'
+      and table_name = any(${requiredTables})
+  `;
+  return new Set(rows.map(row => row.table_name));
+}
+
+try {
+  await waitForDatabase();
+  await sql`select pg_advisory_lock(hashtext('api-proxy-schema-init'))`;
+  try {
+    const present = await existingTables();
+    const missing = requiredTables.filter(table => !present.has(table));
+    if (missing.length === 0) {
+      console.log("[schema] PostgreSQL schema exists, skipping initialization");
+    } else {
+      console.log(`[schema] initializing PostgreSQL schema, missing: ${missing.join(", ")}`);
+      for (const statement of statements) {
+        await sql.unsafe(statement);
+      }
+      console.log("[schema] PostgreSQL schema initialized");
+    }
+  } finally {
+    await sql`select pg_advisory_unlock(hashtext('api-proxy-schema-init'))`;
+  }
+} finally {
+  await sql.end();
+}

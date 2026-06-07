@@ -1,0 +1,41 @@
+{
+  "name": "api-proxy",
+  "version": "0.1.0",
+  "private": true,
+  "license": "GPL-3.0-only",
+  "type": "module",
+  "scripts": {
+    "dev": "next dev -p 3000",
+    "build": "next build",
+    "start": "next start -p 3000",
+    "db:studio": "drizzle-kit studio --config drizzle.pg.config.ts",
+    "db:pg:generate": "drizzle-kit generate --config drizzle.pg.config.ts",
+    "db:pg:migrate": "drizzle-kit migrate --config drizzle.pg.config.ts",
+    "db:pg:push": "drizzle-kit push --config drizzle.pg.config.ts",
+    "db:pg:init": "node scripts/init-postgres-schema.mjs",
+    "compose:dev:up": "docker compose -f docker-compose.dev.yml up -d",
+    "compose:dev:infra": "docker compose -f docker-compose.dev.yml up -d postgres redis",
+    "compose:dev:app": "docker compose -f docker-compose.dev.yml --profile app up -d app",
+    "compose:dev:down": "docker compose -f docker-compose.dev.yml down",
+    "compose:dev:logs": "docker compose -f docker-compose.dev.yml logs -f app",
+    "compose:dev:pg:push": "docker compose -f docker-compose.dev.yml exec app bun run db:pg:push"
+  },
+  "dependencies": {
+    "drizzle-orm": "^0.38.3",
+    "nanoid": "^5.0.9",
+    "next": "15.1.3",
+    "postgres": "^3.4.9",
+    "react": "19.0.0",
+    "react-dom": "19.0.0",
+    "recharts": "^3.8.1",
+    "redis": "^6.0.0"
+  },
+  "devDependencies": {
+    "@types/node": "^22.10.5",
+    "@types/react": "^19.0.2",
+    "@types/react-dom": "^19.0.2",
+    "drizzle-kit": "^0.30.1",
+    "tsx": "^4.19.2",
+    "typescript": "^5.7.2"
+  }
+}
