@@ -31,6 +31,7 @@ export async function PATCH(req: NextRequest) {
     defaultRateLimitRpm: body.defaultRateLimitRpm === undefined ? undefined : Number(body.defaultRateLimitRpm),
     defaultRateLimitTpm: body.defaultRateLimitTpm === undefined ? undefined : Number(body.defaultRateLimitTpm),
     defaultMaxConcurrency: body.defaultMaxConcurrency === undefined ? undefined : Number(body.defaultMaxConcurrency),
+    globalBillingMultiplier: body.globalBillingMultiplier === undefined ? undefined : Number(body.globalBillingMultiplier),
     siteUrl: typeof body.siteUrl === "string" ? body.siteUrl.trim() : undefined,
     siteName: typeof body.siteName === "string" ? body.siteName.trim() : undefined,
     siteLogoUrl: typeof body.siteLogoUrl === "string" ? body.siteLogoUrl.trim() : undefined,

@@ -15,6 +15,7 @@ export type AppSettings = {
   defaultRateLimitRpm: number;
   defaultRateLimitTpm: number;
   defaultMaxConcurrency: number;
+  globalBillingMultiplier: number;
   siteUrl: string;
   siteName: string;
   siteLogoUrl: string;
@@ -44,6 +45,7 @@ const defaults: AppSettings = {
   defaultRateLimitRpm: 0,
   defaultRateLimitTpm: 0,
   defaultMaxConcurrency: 0,
+  globalBillingMultiplier: 1,
   siteUrl: "http://localhost:3000",
   siteName: "api-proxy",
   siteLogoUrl: "",
@@ -76,6 +78,7 @@ export function getSettings(): AppSettings {
     defaultRateLimitRpm: Math.max(0, Number(values.get("defaultRateLimitRpm")) || defaults.defaultRateLimitRpm),
     defaultRateLimitTpm: Math.max(0, Number(values.get("defaultRateLimitTpm")) || defaults.defaultRateLimitTpm),
     defaultMaxConcurrency: Math.max(0, Number(values.get("defaultMaxConcurrency")) || defaults.defaultMaxConcurrency),
+    globalBillingMultiplier: nonNegativeNumber(values.get("globalBillingMultiplier"), defaults.globalBillingMultiplier),
     siteUrl: values.get("siteUrl") || defaults.siteUrl,
     siteName: values.get("siteName") || defaults.siteName,
     siteLogoUrl: values.get("siteLogoUrl") || defaults.siteLogoUrl,
@@ -115,6 +118,7 @@ export function updateSettings(input: Partial<AppSettings>) {
     defaultRateLimitRpm: Math.max(0, Number(input.defaultRateLimitRpm) || current.defaultRateLimitRpm),
     defaultRateLimitTpm: Math.max(0, Number(input.defaultRateLimitTpm) || current.defaultRateLimitTpm),
     defaultMaxConcurrency: Math.max(0, Number(input.defaultMaxConcurrency) || current.defaultMaxConcurrency),
+    globalBillingMultiplier: input.globalBillingMultiplier === undefined ? current.globalBillingMultiplier : Math.max(0, Number(input.globalBillingMultiplier) || 0),
     siteUrl: input.siteUrl ?? current.siteUrl,
     siteName: input.siteName ?? current.siteName,
     siteLogoUrl: input.siteLogoUrl ?? current.siteLogoUrl,
@@ -175,6 +179,7 @@ function settingsFromRows(rows: { key: string; value: string }[]): AppSettings {
     defaultRateLimitRpm: Math.max(0, Number(values.get("defaultRateLimitRpm")) || defaults.defaultRateLimitRpm),
     defaultRateLimitTpm: Math.max(0, Number(values.get("defaultRateLimitTpm")) || defaults.defaultRateLimitTpm),
     defaultMaxConcurrency: Math.max(0, Number(values.get("defaultMaxConcurrency")) || defaults.defaultMaxConcurrency),
+    globalBillingMultiplier: nonNegativeNumber(values.get("globalBillingMultiplier"), defaults.globalBillingMultiplier),
     siteUrl: values.get("siteUrl") || defaults.siteUrl,
     siteName: values.get("siteName") || defaults.siteName,
     siteLogoUrl: values.get("siteLogoUrl") || defaults.siteLogoUrl,
@@ -206,6 +211,7 @@ function nextSettings(current: AppSettings, input: Partial<AppSettings>): AppSet
     defaultRateLimitRpm: Math.max(0, Number(input.defaultRateLimitRpm) || current.defaultRateLimitRpm),
     defaultRateLimitTpm: Math.max(0, Number(input.defaultRateLimitTpm) || current.defaultRateLimitTpm),
     defaultMaxConcurrency: Math.max(0, Number(input.defaultMaxConcurrency) || current.defaultMaxConcurrency),
+    globalBillingMultiplier: input.globalBillingMultiplier === undefined ? current.globalBillingMultiplier : Math.max(0, Number(input.globalBillingMultiplier) || 0),
     siteUrl: input.siteUrl ?? current.siteUrl,
     siteName: input.siteName ?? current.siteName,
     siteLogoUrl: input.siteLogoUrl ?? current.siteLogoUrl,
@@ -228,6 +234,12 @@ function nextSettings(current: AppSettings, input: Partial<AppSettings>): AppSet
 function bool(value: string | undefined, fallback: boolean) {
   if (value === undefined) return fallback;
   return value === "1" || value === "true";
+}
+
+function nonNegativeNumber(value: string | undefined, fallback: number) {
+  if (value === undefined) return fallback;
+  const number = Number(value);
+  return Number.isFinite(number) ? Math.max(0, number) : fallback;
 }
 
 function secure(value: string | undefined): AppSettings["smtpSecure"] {

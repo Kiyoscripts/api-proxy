@@ -16,6 +16,7 @@ type AppSettings = {
   defaultRateLimitRpm: number;
   defaultRateLimitTpm: number;
   defaultMaxConcurrency: number;
+  globalBillingMultiplier: number;
   siteUrl: string;
   siteName: string;
   siteLogoUrl: string;
@@ -183,6 +184,7 @@ export function SettingsForm() {
             <h2>默认用户限制</h2>
             <div className="field-row"><div className="field"><LabelHelp label="默认 RPM" help="Requests Per Minute，每分钟最多允许的请求次数。" /><input className="mono" value={settings.defaultRateLimitRpm || ""} placeholder="不限" onChange={e => setSettings({ ...settings, defaultRateLimitRpm: Number(e.target.value.replace(/\D/g, "")) || 0 })} /></div><div className="field"><LabelHelp label="默认 TPM" help="Tokens Per Minute，每分钟最多允许消耗的输入与输出 Token 总数。" /><input className="mono" value={settings.defaultRateLimitTpm || ""} placeholder="不限" onChange={e => setSettings({ ...settings, defaultRateLimitTpm: Number(e.target.value.replace(/\D/g, "")) || 0 })} /></div></div>
             <div className="field"><LabelHelp label="默认最大并发" help="同一用户同一时间最多允许多少个请求正在运行。" /><input className="mono" value={settings.defaultMaxConcurrency || ""} placeholder="不限" onChange={e => setSettings({ ...settings, defaultMaxConcurrency: Number(e.target.value.replace(/\D/g, "")) || 0 })} /></div>
+            <div className="field"><LabelHelp label="全局计费倍率" help="按模型定价计算出的费用会统一乘以该倍率，影响费用展示和用户额度扣减。" /><input className="mono" value={settings.globalBillingMultiplier} placeholder="1" onChange={e => setSettings({ ...settings, globalBillingMultiplier: Math.max(0, Number(e.target.value.replace(/[^\d.]/g, "")) || 0) })} /></div>
             <div className="hint">用户未单独配置这些限制时使用这里的默认值；填空或 0 表示不限制。</div>
           </div>
         </div>

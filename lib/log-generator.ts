@@ -5,6 +5,7 @@ import { addTpm } from "@/lib/rate-limit";
 import { getRedis } from "@/lib/redis";
 import { usePostgres } from "@/lib/db/runtime";
 import { modelLookupCandidates } from "@/lib/model-variants";
+import { getSettings, getSettingsAsync } from "@/lib/settings";
 
 type Subscriber = (entry: LogEntry) => void;
 type LogInput = Omit<LogEntry, "id" | "cacheTokens" | "cacheReadTokens" | "cacheCreationTokens" | "ttftMs" | "durationMs" | "cost"> & {
@@ -326,10 +327,10 @@ function logCost(provider: "claude" | "openai", channelId: string, model: string
   const prices = db.select().from(schema.modelPrices).all().filter(row => candidates.includes(row.model));
   const resolvedPrice = resolvePrice(provider, channelId, candidates, prices);
   if (!resolvedPrice) return 0;
-  return (tokensIn / 1_000_000) * resolvedPrice.inputPricePerMTok
+  return ((tokensIn / 1_000_000) * resolvedPrice.inputPricePerMTok
     + (tokensOut / 1_000_000) * resolvedPrice.outputPricePerMTok
     + (cacheReadTokens / 1_000_000) * resolvedPrice.cacheReadPricePerMTok
-    + (cacheCreationTokens / 1_000_000) * resolvedPrice.cacheCreationPricePerMTok;
+    + (cacheCreationTokens / 1_000_000) * resolvedPrice.cacheCreationPricePerMTok) * getSettings().globalBillingMultiplier;
 }
 
 async function logCostAsync(provider: "claude" | "openai", channelId: string, model: string, tokensIn: number, tokensOut: number, cacheReadTokens: number, cacheCreationTokens: number) {
@@ -338,10 +339,11 @@ async function logCostAsync(provider: "claude" | "openai", channelId: string, mo
   const prices = (await pgDb.select().from(pgSchema.modelPrices)).filter(row => candidates.includes(row.model));
   const price = resolvePrice(provider, channelId, candidates, prices);
   if (!price) return 0;
-  return (tokensIn / 1_000_000) * price.inputPricePerMTok
+  const billingMultiplier = (await getSettingsAsync()).globalBillingMultiplier;
+  return ((tokensIn / 1_000_000) * price.inputPricePerMTok
     + (tokensOut / 1_000_000) * price.outputPricePerMTok
     + (cacheReadTokens / 1_000_000) * price.cacheReadPricePerMTok
-    + (cacheCreationTokens / 1_000_000) * price.cacheCreationPricePerMTok;
+    + (cacheCreationTokens / 1_000_000) * price.cacheCreationPricePerMTok) * billingMultiplier;
 }
 
 function resolvePrice<T extends { provider: string; channelId?: string; model: string }>(provider: "claude" | "openai", channelId: string, models: string[], prices: T[]) {
